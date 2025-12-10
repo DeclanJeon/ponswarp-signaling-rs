@@ -30,6 +30,25 @@ pub enum ClientMessage {
         target: Option<String>,
     },
 
+    // File Transfer Manifest (Native QUIC mode)
+    Manifest {
+        room_id: String,
+        manifest: String,  // JSON stringified manifest
+        target: Option<String>,
+    },
+
+    // 🆕 Transfer Ready (Receiver -> Sender)
+    TransferReady {
+        room_id: String,
+        target: Option<String>,
+    },
+
+    // 🆕 Transfer Complete (Receiver -> Sender)
+    TransferComplete {
+        room_id: String,
+        target: Option<String>,
+    },
+
     // TURN
     RequestTurnConfig {
         room_id: String,
@@ -83,6 +102,22 @@ pub enum ServerMessage {
     IceCandidate {
         from: String,
         candidate: String,
+    },
+
+    // File Transfer Manifest (Native QUIC mode)
+    Manifest {
+        from: String,
+        manifest: String,
+    },
+
+    // 🆕 Transfer Ready (Receiver -> Sender)
+    TransferReady {
+        from: String,
+    },
+
+    // 🆕 Transfer Complete (Receiver -> Sender)
+    TransferComplete {
+        from: String,
     },
 
     // TURN

@@ -178,6 +178,34 @@ async fn handle_client_message(
             )
             .await;
         }
+        ClientMessage::Manifest { room_id, manifest, target } => {
+            handlers::handle_manifest(
+                state.clone(),
+                peer_id,
+                &room_id,
+                &manifest,
+                target.as_deref(),
+            )
+            .await;
+        }
+        ClientMessage::TransferReady { room_id, target } => {
+            handlers::handle_transfer_ready(
+                state.clone(),
+                peer_id,
+                &room_id,
+                target.as_deref(),
+            )
+            .await;
+        }
+        ClientMessage::TransferComplete { room_id, target } => {
+            handlers::handle_transfer_complete(
+                state.clone(),
+                peer_id,
+                &room_id,
+                target.as_deref(),
+            )
+            .await;
+        }
         ClientMessage::RequestTurnConfig { room_id, .. } => {
             handlers::handle_turn_config_request(state.clone(), sender, &room_id).await;
         }

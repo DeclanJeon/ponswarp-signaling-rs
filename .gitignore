@@ -28,3 +28,5 @@ lerna-debug.log*
 # Build outputs
 /dist
 /build
+
+deploy.*
