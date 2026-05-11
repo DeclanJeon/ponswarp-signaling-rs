@@ -2,6 +2,9 @@
 
 use crate::config::Config;
 use crate::protocol::ServerMessage;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::Client;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -16,15 +19,89 @@ pub struct AppState {
     pub peers: DashMap<String, PeerSession>,
     /// 설정
     pub config: Arc<Config>,
+    /// Cloudflare R2 임시 파일 공유 저장소
+    pub cloud: Option<Arc<CloudStorage>>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub async fn new(config: Config) -> Self {
+        let cloud = CloudStorage::from_config(&config).await.map(Arc::new);
         Self {
             rooms: DashMap::new(),
             peers: DashMap::new(),
             config: Arc::new(config),
+            cloud,
         }
+    }
+
+    pub fn cloud_storage(
+        &self,
+    ) -> Result<&CloudStorage, crate::handlers::cloud_share::CloudShareError> {
+        self.cloud.as_deref().ok_or_else(|| {
+            crate::handlers::cloud_share::CloudShareError::bad_request(
+                "Cloud share is not configured",
+            )
+        })
+    }
+}
+
+/// Cloudflare R2 S3 API client.
+pub struct CloudStorage {
+    pub client: Client,
+    pub bucket: String,
+    pub prefix: String,
+}
+
+impl CloudStorage {
+    async fn from_config(config: &Config) -> Option<Self> {
+        let cloud = &config.cloud;
+        if !cloud.enabled {
+            tracing::info!("Cloud share disabled");
+            return None;
+        }
+        if cloud.bucket.is_empty()
+            || cloud.endpoint.is_empty()
+            || cloud.access_key_id.is_empty()
+            || cloud.secret_access_key.is_empty()
+        {
+            tracing::warn!("Cloud share requested but R2 configuration is incomplete");
+            return None;
+        }
+
+        let credentials = Credentials::new(
+            cloud.access_key_id.clone(),
+            cloud.secret_access_key.clone(),
+            None,
+            None,
+            "ponswarp-r2-env",
+        );
+        let shared_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(cloud.region.clone()))
+            .credentials_provider(credentials)
+            .load()
+            .await;
+        let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+            .endpoint_url(cloud.endpoint.clone())
+            .force_path_style(true)
+            .build();
+
+        Some(Self {
+            client: Client::from_conf(s3_config),
+            bucket: cloud.bucket.clone(),
+            prefix: cloud.prefix.trim_matches('/').to_string(),
+        })
+    }
+
+    pub fn manifest_prefix(&self) -> String {
+        format!("{}/manifests/", self.prefix)
+    }
+
+    pub fn manifest_key(&self, share_id: &str) -> String {
+        format!("{}{share_id}.json", self.manifest_prefix())
+    }
+
+    pub fn file_key(&self, share_id: &str, file_id: &str) -> String {
+        format!("{}/shares/{share_id}/files/{file_id}", self.prefix)
     }
 }
 

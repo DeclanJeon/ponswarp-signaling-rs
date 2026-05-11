@@ -11,7 +11,7 @@ use axum::{
         State, WebSocketUpgrade,
     },
     response::{Html, IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use config::Config;
@@ -33,7 +33,7 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let state = Arc::new(AppState::new(config.clone()));
+    let state = Arc::new(AppState::new(config.clone()).await);
 
     // 방 정리 스케줄러
     let cleanup_state = state.clone();
@@ -42,6 +42,18 @@ async fn main() {
         loop {
             interval.tick().await;
             handlers::cleanup_old_rooms(cleanup_state.clone()).await;
+        }
+    });
+
+    // R2 임시 공유 정리 스케줄러
+    let cloud_cleanup_state = state.clone();
+    let cloud_cleanup_interval_seconds = config.cloud.cleanup_interval_seconds.max(60);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(cloud_cleanup_interval_seconds));
+        loop {
+            interval.tick().await;
+            handlers::cleanup_expired_cloud_shares(cloud_cleanup_state.clone()).await;
         }
     });
 
@@ -56,6 +68,16 @@ async fn main() {
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
         .route("/ws", get(ws_handler))
+        .route("/api/cloud-share", post(handlers::create_cloud_share))
+        .route("/api/cloud-share/:share_id", get(handlers::get_cloud_share))
+        .route(
+            "/api/cloud-share/:share_id/complete",
+            post(handlers::complete_cloud_share),
+        )
+        .route(
+            "/api/cloud-share/:share_id/files/:file_id/download",
+            get(handlers::download_cloud_file),
+        )
         .layer(cors)
         .with_state(state.clone());
 

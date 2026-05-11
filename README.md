@@ -33,6 +33,36 @@ cp .env.example .env
 - `GET /` - 서버 정보
 - `GET /health` - 헬스 체크
 - `GET /ws` - WebSocket 엔드포인트
+- `POST /api/cloud-share` - Cloudflare R2 24시간 공유 생성 및 업로드 URL 발급
+- `POST /api/cloud-share/:share_id/complete` - 공유 업로드 완료 처리
+- `GET /api/cloud-share/:share_id` - 공개 다운로드 매니페스트 조회
+- `GET /api/cloud-share/:share_id/files/:file_id/download` - 파일 다운로드 URL 리다이렉트
+
+### Cloudflare R2 24시간 공유
+
+Cloud share는 R2 S3 호환 API를 사용합니다. 아래 환경 변수를 설정하면 서버 시작 시 자동으로 활성화됩니다.
+
+```env
+PONSWARP_CLOUD_ENABLED=true
+R2_ACCOUNT_ID=...
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+R2_BUCKET_NAME=...
+# 선택: R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
+
+PONSWARP_CLOUD_PREFIX=ponswarp-cloud
+PONSWARP_CLOUD_RETENTION_SECONDS=86400
+PONSWARP_CLOUD_UPLOAD_URL_TTL_SECONDS=3600
+PONSWARP_CLOUD_DOWNLOAD_URL_TTL_SECONDS=300
+PONSWARP_CLOUD_CLEANUP_INTERVAL_SECONDS=300
+PONSWARP_CLOUD_MAX_FILES=100
+PONSWARP_CLOUD_MAX_FILE_BYTES=10737418240
+PONSWARP_CLOUD_MAX_TOTAL_BYTES=10737418240
+```
+
+서버는 만료된 공유를 주기적으로 삭제합니다. 운영 환경에서는 R2 버킷 라이프사이클도 1일 만료로 같이 설정하는 것을 권장합니다.
+브라우저가 presigned PUT/GET 요청을 직접 보내므로 R2 버킷 CORS에는 프론트엔드 Origin과 `PUT`, `GET`, `HEAD` 메서드를 허용해야 합니다.
+Cloud Drop은 공유 1건당 최대 10GB입니다. 10GB를 넘는 파일은 직접 P2P 전송을 사용하거나 10GB 단위로 분할해서 공유해야 합니다.
 
 ## 메시지 프로토콜
 

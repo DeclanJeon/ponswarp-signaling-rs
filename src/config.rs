@@ -11,6 +11,7 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub room: RoomConfig,
     pub turn: TurnConfig,
+    pub cloud: CloudConfig,
     pub log_level: String,
 }
 
@@ -44,10 +45,57 @@ pub struct TurnPorts {
     pub tls: u16,
 }
 
+/// Cloudflare R2 backed temporary file share 설정
+#[derive(Debug, Clone)]
+pub struct CloudConfig {
+    pub enabled: bool,
+    pub bucket: String,
+    pub endpoint: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub region: String,
+    pub prefix: String,
+    pub retention_seconds: u64,
+    pub upload_url_ttl_seconds: u64,
+    pub download_url_ttl_seconds: u64,
+    pub cleanup_interval_seconds: u64,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
 impl Config {
     /// 환경 변수에서 설정 로드
     pub fn from_env() -> Self {
         dotenvy::dotenv().ok();
+
+        let r2_account_id = env::var("R2_ACCOUNT_ID").unwrap_or_default();
+        let r2_endpoint = env::var("R2_ENDPOINT")
+            .or_else(|_| env::var("CLOUDFLARE_R2_ENDPOINT"))
+            .unwrap_or_else(|_| {
+                if r2_account_id.is_empty() {
+                    String::new()
+                } else {
+                    format!("https://{}.r2.cloudflarestorage.com", r2_account_id)
+                }
+            });
+        let r2_bucket = env::var("R2_BUCKET_NAME")
+            .or_else(|_| env::var("CLOUDFLARE_R2_BUCKET"))
+            .unwrap_or_default();
+        let r2_access_key = env::var("R2_ACCESS_KEY_ID")
+            .or_else(|_| env::var("CLOUDFLARE_R2_ACCESS_KEY_ID"))
+            .unwrap_or_default();
+        let r2_secret_key = env::var("R2_SECRET_ACCESS_KEY")
+            .or_else(|_| env::var("CLOUDFLARE_R2_SECRET_ACCESS_KEY"))
+            .unwrap_or_default();
+        let cloud_enabled = env::var("PONSWARP_CLOUD_ENABLED")
+            .map(|v| v != "false")
+            .unwrap_or_else(|_| {
+                !r2_endpoint.is_empty()
+                    && !r2_bucket.is_empty()
+                    && !r2_access_key.is_empty()
+                    && !r2_secret_key.is_empty()
+            });
 
         Self {
             port: env::var("PORT")
@@ -107,6 +155,47 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.trim().to_string())
                     .collect(),
+            },
+            cloud: CloudConfig {
+                enabled: cloud_enabled,
+                bucket: r2_bucket,
+                endpoint: r2_endpoint,
+                access_key_id: r2_access_key,
+                secret_access_key: r2_secret_key,
+                region: env::var("R2_REGION")
+                    .or_else(|_| env::var("CLOUDFLARE_R2_REGION"))
+                    .unwrap_or_else(|_| "auto".to_string()),
+                prefix: env::var("PONSWARP_CLOUD_PREFIX")
+                    .unwrap_or_else(|_| "ponswarp-cloud".to_string()),
+                retention_seconds: env::var("PONSWARP_CLOUD_RETENTION_SECONDS")
+                    .unwrap_or_else(|_| "86400".to_string())
+                    .parse()
+                    .unwrap_or(86400),
+                upload_url_ttl_seconds: env::var("PONSWARP_CLOUD_UPLOAD_URL_TTL_SECONDS")
+                    .or_else(|_| env::var("R2_SIGNED_URL_TTL_SECONDS"))
+                    .unwrap_or_else(|_| "3600".to_string())
+                    .parse()
+                    .unwrap_or(3600),
+                download_url_ttl_seconds: env::var("PONSWARP_CLOUD_DOWNLOAD_URL_TTL_SECONDS")
+                    .unwrap_or_else(|_| "300".to_string())
+                    .parse()
+                    .unwrap_or(300),
+                cleanup_interval_seconds: env::var("PONSWARP_CLOUD_CLEANUP_INTERVAL_SECONDS")
+                    .unwrap_or_else(|_| "300".to_string())
+                    .parse()
+                    .unwrap_or(300),
+                max_files: env::var("PONSWARP_CLOUD_MAX_FILES")
+                    .unwrap_or_else(|_| "100".to_string())
+                    .parse()
+                    .unwrap_or(100),
+                max_file_bytes: env::var("PONSWARP_CLOUD_MAX_FILE_BYTES")
+                    .unwrap_or_else(|_| "10737418240".to_string())
+                    .parse()
+                    .unwrap_or(10 * 1024 * 1024 * 1024),
+                max_total_bytes: env::var("PONSWARP_CLOUD_MAX_TOTAL_BYTES")
+                    .unwrap_or_else(|_| "10737418240".to_string())
+                    .parse()
+                    .unwrap_or(10 * 1024 * 1024 * 1024),
             },
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
         }
