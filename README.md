@@ -79,15 +79,18 @@ PONSWARP_BILLING_ENABLED=false
 
 # 유료화/권한/사용량 기록을 켤 때 필요합니다.
 PONSWARP_PUBLIC_APP_URL=https://warp.ponslink.com
-STRIPE_SECRET_KEY=sk_live_...
-STRIPE_WEBHOOK_SECRET=whsec_...
+PAYPAL_API_BASE=https://api-m.paypal.com
+PAYPAL_CLIENT_ID=...
+PAYPAL_CLIENT_SECRET=...
+PAYPAL_WEBHOOK_ID=...
+PAYPAL_PRO_PLAN_ID=...
 DATABASE_URL=postgres://ponswarp:password@127.0.0.1:5432/ponswarp
 DATABASE_MAX_CONNECTIONS=5
 DATABASE_RUN_MIGRATIONS=true
 ```
 
-`GET /ready`는 운영 헬스체크에 사용할 수 있습니다. `PONSWARP_BILLING_ENABLED=true`일 때는 Postgres, Stripe secret key, Stripe webhook secret이 모두 없으면 서버가 기동에 실패합니다.
-Stripe webhook URL은 `https://warp.ponslink.com/api/billing/webhook`이며, `checkout.session.completed` 이벤트를 보내야 Drop Pass/Pro entitlement가 생성됩니다.
+`GET /ready`는 운영 헬스체크에 사용할 수 있습니다. `PONSWARP_BILLING_ENABLED=true`일 때는 Postgres와 PayPal REST 앱 키, webhook id, Pro subscription plan id가 모두 없으면 서버가 기동에 실패합니다.
+PayPal webhook URL은 `https://warp.ponslink.com/api/billing/webhook`입니다. `BILLING.SUBSCRIPTION.ACTIVATED`, `BILLING.SUBSCRIPTION.CANCELLED`, `BILLING.SUBSCRIPTION.SUSPENDED`, `BILLING.SUBSCRIPTION.EXPIRED` 이벤트를 보내면 Pro entitlement 상태가 반영됩니다. 단건 Drop Pass는 PayPal 승인 복귀 후 `/api/billing/capture`에서 capture와 entitlement 발급을 완료합니다.
 
 ## 메시지 프로토콜
 

@@ -1,7 +1,9 @@
-//! Stripe Checkout and webhook handling for Cloud Drop entitlements.
+//! PayPal Checkout and webhook handling for Cloud Drop entitlements.
 
 use crate::config::Config;
-use crate::database::{CloudDatabase, PaidEntitlementInput};
+use crate::database::{
+    CloudDatabase, PayPalOrderEntitlementInput, PayPalSubscriptionEntitlementInput,
+};
 use crate::state::AppState;
 use anyhow::{bail, Result};
 use axum::body::Bytes;
@@ -9,20 +11,19 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::Sha256;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct BillingClient {
     http: reqwest::Client,
-    stripe_secret_key: String,
-    stripe_webhook_secret: String,
+    client_id: String,
+    client_secret: String,
+    webhook_id: String,
+    api_base: String,
+    pro_plan_id: String,
     public_app_url: String,
 }
 
@@ -32,6 +33,12 @@ pub struct CheckoutRequest {
     mode: CheckoutMode,
     sku: String,
     return_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureRequest {
+    order_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -49,6 +56,12 @@ pub struct CheckoutResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CaptureResponse {
+    entitlement_token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BillingErrorBody {
     error: String,
 }
@@ -59,11 +72,17 @@ impl BillingClient {
             return Ok(None);
         }
 
-        if config.billing.stripe_secret_key.trim().is_empty() {
-            bail!("PONSWARP_BILLING_ENABLED=true requires STRIPE_SECRET_KEY");
+        if config.billing.paypal_client_id.trim().is_empty() {
+            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_CLIENT_ID");
         }
-        if config.billing.stripe_webhook_secret.trim().is_empty() {
-            bail!("PONSWARP_BILLING_ENABLED=true requires STRIPE_WEBHOOK_SECRET");
+        if config.billing.paypal_client_secret.trim().is_empty() {
+            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_CLIENT_SECRET");
+        }
+        if config.billing.paypal_webhook_id.trim().is_empty() {
+            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_WEBHOOK_ID");
+        }
+        if config.billing.paypal_pro_plan_id.trim().is_empty() {
+            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_PRO_PLAN_ID");
         }
         if config.billing.public_app_url.trim().is_empty() {
             bail!("PONSWARP_BILLING_ENABLED=true requires PONSWARP_PUBLIC_APP_URL");
@@ -71,8 +90,15 @@ impl BillingClient {
 
         Ok(Some(Self {
             http: reqwest::Client::new(),
-            stripe_secret_key: config.billing.stripe_secret_key.clone(),
-            stripe_webhook_secret: config.billing.stripe_webhook_secret.clone(),
+            client_id: config.billing.paypal_client_id.clone(),
+            client_secret: config.billing.paypal_client_secret.clone(),
+            webhook_id: config.billing.paypal_webhook_id.clone(),
+            api_base: config
+                .billing
+                .paypal_api_base
+                .trim_end_matches('/')
+                .to_string(),
+            pro_plan_id: config.billing.paypal_pro_plan_id.clone(),
             public_app_url: config
                 .billing
                 .public_app_url
@@ -81,7 +107,7 @@ impl BillingClient {
         }))
     }
 
-    async fn create_checkout_session(
+    async fn create_checkout(
         &self,
         request: CheckoutRequest,
     ) -> Result<CheckoutResponse, BillingError> {
@@ -93,47 +119,195 @@ impl BillingClient {
             ));
         }
         let return_url = self.validate_return_url(&request.return_url)?;
-        let success_url = append_query(
-            &return_url,
-            "checkout=success&cloudEntitlement={CHECKOUT_SESSION_ID}",
-        );
-        let cancel_url = append_query(&return_url, "checkout=cancelled");
 
-        let mut form = vec![
-            ("mode".to_string(), plan.stripe_mode().to_string()),
-            ("success_url".to_string(), success_url),
-            ("cancel_url".to_string(), cancel_url),
-            ("line_items[0][quantity]".to_string(), "1".to_string()),
-            (
-                "line_items[0][price_data][currency]".to_string(),
-                "krw".to_string(),
-            ),
-            (
-                "line_items[0][price_data][unit_amount]".to_string(),
-                plan.price_krw.to_string(),
-            ),
-            (
-                "line_items[0][price_data][product_data][name]".to_string(),
-                plan.label.to_string(),
-            ),
-            ("metadata[sku]".to_string(), plan.sku.to_string()),
-            (
-                "metadata[kind]".to_string(),
-                "ponswarp_cloud_drop".to_string(),
-            ),
-        ];
-        if request.mode == CheckoutMode::Subscription {
-            form.push((
-                "line_items[0][price_data][recurring][interval]".to_string(),
-                "month".to_string(),
+        match request.mode {
+            CheckoutMode::Payment => self.create_order_checkout(plan, &return_url).await,
+            CheckoutMode::Subscription => {
+                self.create_subscription_checkout(plan, &return_url).await
+            }
+        }
+    }
+
+    async fn create_order_checkout(
+        &self,
+        plan: PaidPlan,
+        return_url: &str,
+    ) -> Result<CheckoutResponse, BillingError> {
+        let access_token = self.access_token().await?;
+        let payload = json!({
+            "intent": "CAPTURE",
+            "purchase_units": [{
+                "reference_id": plan.sku,
+                "custom_id": plan.sku,
+                "description": plan.label,
+                "amount": {
+                    "currency_code": "KRW",
+                    "value": plan.price_krw.to_string(),
+                },
+            }],
+            "application_context": {
+                "brand_name": "PonsWarp",
+                "landing_page": "LOGIN",
+                "user_action": "PAY_NOW",
+                "return_url": append_query(return_url, "checkout=success"),
+                "cancel_url": append_query(return_url, "checkout=cancelled"),
+            },
+        });
+
+        let value = self
+            .post_json("/v2/checkout/orders", &access_token, &payload)
+            .await?;
+        approval_url(&value).map(|checkout_url| CheckoutResponse { checkout_url })
+    }
+
+    async fn create_subscription_checkout(
+        &self,
+        plan: PaidPlan,
+        return_url: &str,
+    ) -> Result<CheckoutResponse, BillingError> {
+        let access_token = self.access_token().await?;
+        let payload = json!({
+            "plan_id": self.pro_plan_id.as_str(),
+            "custom_id": plan.sku,
+            "application_context": {
+                "brand_name": "PonsWarp",
+                "user_action": "SUBSCRIBE_NOW",
+                "return_url": append_query(return_url, "checkout=success"),
+                "cancel_url": append_query(return_url, "checkout=cancelled"),
+            },
+        });
+
+        let value = self
+            .post_json("/v1/billing/subscriptions", &access_token, &payload)
+            .await?;
+        approval_url(&value).map(|checkout_url| CheckoutResponse { checkout_url })
+    }
+
+    async fn capture_order(
+        &self,
+        database: &CloudDatabase,
+        order_id: &str,
+    ) -> Result<CaptureResponse, BillingError> {
+        let order_id = order_id.trim();
+        if order_id.is_empty() {
+            return Err(BillingError::bad_request("Missing PayPal order id"));
+        }
+
+        if database
+            .resolve_entitlement(order_id, unix_now())
+            .await
+            .map_err(BillingError::internal)?
+            .is_some()
+        {
+            return Ok(CaptureResponse {
+                entitlement_token: order_id.to_string(),
+            });
+        }
+
+        let access_token = self.access_token().await?;
+        let value = self
+            .post_json(
+                &format!("/v2/checkout/orders/{}/capture", url_path(order_id)),
+                &access_token,
+                &json!({}),
+            )
+            .await?;
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if status != "COMPLETED" {
+            return Err(BillingError::bad_request(
+                "PayPal order has not completed payment",
             ));
         }
 
+        let unit = value
+            .pointer("/purchase_units/0")
+            .ok_or_else(|| BillingError::bad_request("PayPal order is missing purchase unit"))?;
+        let sku = unit
+            .get("reference_id")
+            .and_then(Value::as_str)
+            .or_else(|| unit.get("custom_id").and_then(Value::as_str))
+            .ok_or_else(|| BillingError::bad_request("PayPal order is missing Cloud Drop sku"))?;
+        let Some(plan) = paid_plan(sku) else {
+            return Err(BillingError::bad_request(
+                "PayPal order has unknown Cloud Drop sku",
+            ));
+        };
+        if plan.checkout_mode != CheckoutMode::Payment {
+            return Err(BillingError::bad_request(
+                "PayPal order cannot activate a subscription plan",
+            ));
+        }
+        let capture_id = unit
+            .pointer("/payments/captures/0/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BillingError::bad_request("PayPal order is missing capture id"))?;
+        let email = value
+            .pointer("/payer/email_address")
+            .and_then(Value::as_str);
+
+        database
+            .upsert_paypal_order_entitlement(PayPalOrderEntitlementInput {
+                paypal_order_id: order_id,
+                paypal_capture_id: capture_id,
+                email,
+                sku: plan.sku,
+                max_total_bytes: plan.max_total_bytes,
+                max_file_bytes: plan.max_file_bytes,
+                retention_seconds: plan.retention_seconds,
+                created_at: unix_now(),
+            })
+            .await
+            .map_err(BillingError::internal)?;
+
+        Ok(CaptureResponse {
+            entitlement_token: order_id.to_string(),
+        })
+    }
+
+    async fn validate_webhook(
+        &self,
+        headers: &HeaderMap,
+        event: &Value,
+    ) -> Result<(), BillingError> {
+        let access_token = self.access_token().await?;
+        let payload = json!({
+            "auth_algo": required_header(headers, "paypal-auth-algo")?,
+            "cert_url": required_header(headers, "paypal-cert-url")?,
+            "transmission_id": required_header(headers, "paypal-transmission-id")?,
+            "transmission_sig": required_header(headers, "paypal-transmission-sig")?,
+            "transmission_time": required_header(headers, "paypal-transmission-time")?,
+            "webhook_id": self.webhook_id.as_str(),
+            "webhook_event": event,
+        });
+        let value = self
+            .post_json(
+                "/v1/notifications/verify-webhook-signature",
+                &access_token,
+                &payload,
+            )
+            .await?;
+        let status = value
+            .get("verification_status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if status == "SUCCESS" {
+            return Ok(());
+        }
+
+        Err(BillingError::bad_webhook(
+            "PayPal webhook signature verification failed",
+        ))
+    }
+
+    async fn access_token(&self) -> Result<String, BillingError> {
         let value: Value = self
             .http
-            .post("https://api.stripe.com/v1/checkout/sessions")
-            .bearer_auth(&self.stripe_secret_key)
-            .form(&form)
+            .post(format!("{}/v1/oauth2/token", self.api_base))
+            .basic_auth(&self.client_id, Some(&self.client_secret))
+            .form(&[("grant_type", "client_credentials")])
             .send()
             .await
             .map_err(BillingError::internal)?
@@ -143,20 +317,31 @@ impl BillingClient {
             .await
             .map_err(BillingError::internal)?;
 
-        let Some(url) = value.get("url").and_then(Value::as_str) else {
-            return Err(BillingError::internal(
-                "Stripe did not return a checkout URL",
-            ));
-        };
-
-        Ok(CheckoutResponse {
-            checkout_url: url.to_string(),
-        })
+        value
+            .get("access_token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| BillingError::internal("PayPal did not return an access token"))
     }
 
-    fn validate_webhook(&self, body: &[u8], signature: &str) -> Result<Value, BillingError> {
-        verify_stripe_signature(body, signature, &self.stripe_webhook_secret)?;
-        serde_json::from_slice(body).map_err(|error| BillingError::bad_webhook(error.to_string()))
+    async fn post_json(
+        &self,
+        path: &str,
+        access_token: &str,
+        payload: &Value,
+    ) -> Result<Value, BillingError> {
+        self.http
+            .post(format!("{}{}", self.api_base, path))
+            .bearer_auth(access_token)
+            .json(payload)
+            .send()
+            .await
+            .map_err(BillingError::internal)?
+            .error_for_status()
+            .map_err(BillingError::internal)?
+            .json()
+            .await
+            .map_err(BillingError::internal)
     }
 
     fn validate_return_url(&self, return_url: &str) -> Result<String, BillingError> {
@@ -181,13 +366,30 @@ pub async fn create_checkout(
         return BillingError::unavailable("Billing database is not available").into_response();
     }
 
-    match billing.create_checkout_session(request).await {
+    match billing.create_checkout(request).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }
 }
 
-pub async fn stripe_webhook(
+pub async fn capture_checkout(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CaptureRequest>,
+) -> Response {
+    let Some(billing) = state.billing.as_ref() else {
+        return BillingError::unavailable("Billing is not enabled").into_response();
+    };
+    let Some(database) = state.cloud_db.as_ref() else {
+        return BillingError::unavailable("Billing database is not available").into_response();
+    };
+
+    match billing.capture_order(database, &request.order_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+pub async fn paypal_webhook(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
@@ -198,85 +400,88 @@ pub async fn stripe_webhook(
     let Some(database) = state.cloud_db.as_ref() else {
         return BillingError::unavailable("Billing database is not available").into_response();
     };
-    let Some(signature) = headers
-        .get("stripe-signature")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return BillingError::bad_webhook("Missing Stripe-Signature header").into_response();
-    };
 
-    let event = match billing.validate_webhook(&body, signature) {
+    let event = match serde_json::from_slice::<Value>(&body) {
         Ok(event) => event,
-        Err(error) => return error.into_response(),
+        Err(error) => return BillingError::bad_webhook(error.to_string()).into_response(),
     };
+    if let Err(error) = billing.validate_webhook(&headers, &event).await {
+        return error.into_response();
+    }
 
-    match process_stripe_event(database, &event).await {
-        Ok(()) => Json(serde_json::json!({ "received": true })).into_response(),
+    match process_paypal_event(database, &event).await {
+        Ok(()) => Json(json!({ "received": true })).into_response(),
         Err(error) => error.into_response(),
     }
 }
 
-async fn process_stripe_event(database: &CloudDatabase, event: &Value) -> Result<(), BillingError> {
+async fn process_paypal_event(database: &CloudDatabase, event: &Value) -> Result<(), BillingError> {
     let event_id = event
         .get("id")
         .and_then(Value::as_str)
-        .ok_or_else(|| BillingError::bad_webhook("Stripe event is missing id"))?;
+        .ok_or_else(|| BillingError::bad_webhook("PayPal event is missing id"))?;
     let event_type = event
-        .get("type")
+        .get("event_type")
         .and_then(Value::as_str)
-        .ok_or_else(|| BillingError::bad_webhook("Stripe event is missing type"))?;
-    let event_created = event
-        .get("created")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(unix_now);
+        .ok_or_else(|| BillingError::bad_webhook("PayPal event is missing event_type"))?;
+    let event_created = unix_now();
 
     let is_new = database
-        .try_record_stripe_event(event_id, event_type, event_created, unix_now())
+        .try_record_paypal_event(event_id, event_type, event_created, unix_now())
         .await
         .map_err(BillingError::internal)?;
     if !is_new {
         return Ok(());
     }
 
-    if event_type != "checkout.session.completed" {
-        return Ok(());
+    let resource = event
+        .get("resource")
+        .ok_or_else(|| BillingError::bad_webhook("PayPal event is missing resource"))?;
+
+    match event_type {
+        "BILLING.SUBSCRIPTION.ACTIVATED" => {
+            let subscription_id = resource
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| BillingError::bad_webhook("PayPal subscription is missing id"))?;
+            let sku = resource
+                .get("custom_id")
+                .and_then(Value::as_str)
+                .unwrap_or("pro_monthly_krw_9900");
+            if paid_plan(sku).is_none() {
+                return Err(BillingError::bad_webhook(
+                    "PayPal subscription has unknown sku",
+                ));
+            }
+            let email = resource
+                .pointer("/subscriber/email_address")
+                .and_then(Value::as_str);
+            let paypal_plan_id = resource.get("plan_id").and_then(Value::as_str);
+
+            database
+                .upsert_paypal_subscription_entitlement(PayPalSubscriptionEntitlementInput {
+                    paypal_subscription_id: subscription_id,
+                    paypal_plan_id,
+                    email,
+                    created_at: event_created,
+                })
+                .await
+                .map_err(BillingError::internal)?;
+        }
+        "BILLING.SUBSCRIPTION.CANCELLED"
+        | "BILLING.SUBSCRIPTION.SUSPENDED"
+        | "BILLING.SUBSCRIPTION.EXPIRED" => {
+            let subscription_id = resource
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| BillingError::bad_webhook("PayPal subscription is missing id"))?;
+            database
+                .set_paypal_subscription_status(subscription_id, "inactive", event_created)
+                .await
+                .map_err(BillingError::internal)?;
+        }
+        _ => {}
     }
-
-    let session = event
-        .pointer("/data/object")
-        .ok_or_else(|| BillingError::bad_webhook("Stripe event is missing checkout session"))?;
-    let session_id = session
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| BillingError::bad_webhook("Checkout session is missing id"))?;
-    let sku = session
-        .pointer("/metadata/sku")
-        .and_then(Value::as_str)
-        .ok_or_else(|| BillingError::bad_webhook("Checkout session is missing sku metadata"))?;
-    let Some(plan) = paid_plan(sku) else {
-        return Err(BillingError::bad_webhook(
-            "Checkout session has unknown sku",
-        ));
-    };
-    let email = session
-        .pointer("/customer_details/email")
-        .and_then(Value::as_str)
-        .or_else(|| session.get("customer_email").and_then(Value::as_str));
-
-    database
-        .upsert_paid_entitlement(PaidEntitlementInput {
-            checkout_session_id: session_id,
-            email,
-            sku: plan.sku,
-            max_total_bytes: plan.max_total_bytes,
-            max_file_bytes: plan.max_file_bytes,
-            retention_seconds: plan.retention_seconds,
-            payment_intent_id: session.get("payment_intent").and_then(Value::as_str),
-            subscription_id: session.get("subscription").and_then(Value::as_str),
-            created_at: event_created,
-        })
-        .await
-        .map_err(BillingError::internal)?;
 
     Ok(())
 }
@@ -336,60 +541,29 @@ fn paid_plan(sku: &str) -> Option<PaidPlan> {
     }
 }
 
-impl PaidPlan {
-    fn stripe_mode(&self) -> &'static str {
-        match self.checkout_mode {
-            CheckoutMode::Payment => "payment",
-            CheckoutMode::Subscription => "subscription",
-        }
-    }
+fn approval_url(value: &Value) -> Result<String, BillingError> {
+    value
+        .get("links")
+        .and_then(Value::as_array)
+        .and_then(|links| {
+            links.iter().find_map(|link| {
+                if link.get("rel").and_then(Value::as_str) == Some("approve") {
+                    link.get("href").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+        })
+        .map(str::to_string)
+        .ok_or_else(|| BillingError::internal("PayPal did not return an approval URL"))
 }
 
-fn verify_stripe_signature(
-    body: &[u8],
-    signature_header: &str,
-    secret: &str,
-) -> Result<(), BillingError> {
-    let mut timestamp = None;
-    let mut signatures = Vec::new();
-    for part in signature_header.split(',') {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-        match key {
-            "t" => timestamp = Some(value),
-            "v1" => signatures.push(value),
-            _ => {}
-        }
-    }
-    let Some(timestamp) = timestamp else {
-        return Err(BillingError::bad_webhook(
-            "Stripe signature is missing timestamp",
-        ));
-    };
-    if signatures.is_empty() {
-        return Err(BillingError::bad_webhook("Stripe signature is missing v1"));
-    }
-
-    let mut signed_payload = timestamp.as_bytes().to_vec();
-    signed_payload.push(b'.');
-    signed_payload.extend_from_slice(body);
-
-    for signature in signatures {
-        let Ok(expected) = hex::decode(signature) else {
-            continue;
-        };
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .map_err(|_| BillingError::bad_webhook("Invalid webhook secret"))?;
-        mac.update(&signed_payload);
-        if mac.verify_slice(&expected).is_ok() {
-            return Ok(());
-        }
-    }
-
-    Err(BillingError::bad_webhook(
-        "Stripe webhook signature verification failed",
-    ))
+fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, BillingError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| BillingError::bad_webhook(format!("Missing {name} header")))
 }
 
 fn append_query(url: &str, query: &str) -> String {
@@ -398,6 +572,10 @@ fn append_query(url: &str, query: &str) -> String {
     } else {
         format!("{url}?{query}")
     }
+}
+
+fn url_path(value: &str) -> String {
+    value.replace('/', "%2F")
 }
 
 fn unix_now() -> u64 {
@@ -461,26 +639,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stripe_signature_accepts_valid_hmac() {
-        let body = br#"{"id":"evt_test"}"#;
-        let secret = "whsec_test";
-        let timestamp = "1710000000";
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(timestamp.as_bytes());
-        mac.update(b".");
-        mac.update(body);
-        let signature = hex::encode(mac.finalize().into_bytes());
-        let header = format!("t={timestamp},v1={signature}");
-
-        verify_stripe_signature(body, &header, secret).unwrap();
+    fn append_query_adds_first_query_parameter() {
+        assert_eq!(
+            append_query("https://warp.ponslink.com", "checkout=success"),
+            "https://warp.ponslink.com?checkout=success"
+        );
     }
 
     #[test]
-    fn stripe_signature_rejects_tampered_payload() {
-        let body = br#"{"id":"evt_test"}"#;
-        let secret = "whsec_test";
-        let header = "t=1710000000,v1=000000";
+    fn append_query_preserves_existing_query_parameters() {
+        assert_eq!(
+            append_query(
+                "https://warp.ponslink.com/cloud?mode=drop",
+                "checkout=success"
+            ),
+            "https://warp.ponslink.com/cloud?mode=drop&checkout=success"
+        );
+    }
 
-        assert!(verify_stripe_signature(body, header, secret).is_err());
+    #[test]
+    fn paid_plan_modes_match_checkout_kind() {
+        assert_eq!(
+            paid_plan("drop_1tb_7d").unwrap().checkout_mode,
+            CheckoutMode::Payment
+        );
+        assert_eq!(
+            paid_plan("pro_monthly_krw_9900").unwrap().checkout_mode,
+            CheckoutMode::Subscription
+        );
     }
 }

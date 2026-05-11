@@ -25,11 +25,14 @@ pub struct DatabaseConfig {
     pub run_migrations: bool,
 }
 
-/// Stripe billing 설정
+/// PayPal billing 설정
 #[derive(Debug, Clone)]
 pub struct BillingConfig {
-    pub stripe_secret_key: String,
-    pub stripe_webhook_secret: String,
+    pub paypal_client_id: String,
+    pub paypal_client_secret: String,
+    pub paypal_webhook_id: String,
+    pub paypal_api_base: String,
+    pub paypal_pro_plan_id: String,
     pub public_app_url: String,
 }
 
@@ -141,8 +144,12 @@ impl Config {
                     .unwrap_or(true),
             },
             billing: BillingConfig {
-                stripe_secret_key: env::var("STRIPE_SECRET_KEY").unwrap_or_default(),
-                stripe_webhook_secret: env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default(),
+                paypal_client_id: env::var("PAYPAL_CLIENT_ID").unwrap_or_default(),
+                paypal_client_secret: env::var("PAYPAL_CLIENT_SECRET").unwrap_or_default(),
+                paypal_webhook_id: env::var("PAYPAL_WEBHOOK_ID").unwrap_or_default(),
+                paypal_api_base: env::var("PAYPAL_API_BASE")
+                    .unwrap_or_else(|_| "https://api-m.paypal.com".to_string()),
+                paypal_pro_plan_id: env::var("PAYPAL_PRO_PLAN_ID").unwrap_or_default(),
                 public_app_url: env::var("PONSWARP_PUBLIC_APP_URL")
                     .unwrap_or_else(|_| "https://warp.ponslink.com".to_string()),
             },

@@ -26,7 +26,7 @@ pub struct AppState {
     pub cloud: Option<Arc<CloudStorage>>,
     /// Optional DB-backed Cloud Drop persistence and entitlement state
     pub cloud_db: Option<Arc<CloudDatabase>>,
-    /// Optional Stripe billing client
+    /// Optional PayPal billing client
     pub billing: Option<Arc<BillingClient>>,
 }
 

@@ -78,7 +78,8 @@ async fn main() -> Result<()> {
         .route("/api/cloud-plans", get(handlers::get_cloud_plans))
         .route("/api/cloud-share", post(handlers::create_cloud_share))
         .route("/api/billing/checkout", post(billing::create_checkout))
-        .route("/api/billing/webhook", post(billing::stripe_webhook))
+        .route("/api/billing/capture", post(billing::capture_checkout))
+        .route("/api/billing/webhook", post(billing::paypal_webhook))
         .route("/api/cloud-share/:share_id", get(handlers::get_cloud_share))
         .route(
             "/api/cloud-share/:share_id/complete",
