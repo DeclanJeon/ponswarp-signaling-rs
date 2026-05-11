@@ -131,7 +131,7 @@ fn build_ice_servers(config: &TurnConfig, username: &str, password: &str) -> Vec
 
 /// 자격증명 유효성 검증
 pub fn validate_credentials(username: &str) -> bool {
-    if let Some(expiry_str) = username.split(':').last() {
+    if let Some(expiry_str) = username.split(':').next_back() {
         if let Ok(expiry_time) = expiry_str.parse::<u64>() {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

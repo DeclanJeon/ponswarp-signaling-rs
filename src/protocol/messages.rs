@@ -10,7 +10,9 @@ pub enum ClientMessage {
     Heartbeat,
 
     // Room Management
-    JoinRoom { room_id: String },
+    JoinRoom {
+        room_id: String,
+    },
     LeaveRoom,
 
     // WebRTC Signaling
@@ -33,7 +35,7 @@ pub enum ClientMessage {
     // File Transfer Manifest (Native QUIC mode)
     Manifest {
         room_id: String,
-        manifest: String,  // JSON stringified manifest
+        manifest: String, // JSON stringified manifest
         target: Option<String>,
     },
 
@@ -66,9 +68,14 @@ pub enum ClientMessage {
 #[serde(tag = "type", content = "payload")]
 pub enum ServerMessage {
     // Connection
-    Connected { socket_id: String },
+    Connected {
+        socket_id: String,
+    },
     HeartbeatAck,
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
 
     // Room Events
     JoinedRoom {
@@ -151,4 +158,65 @@ pub struct IceServer {
     pub credential: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_type: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_manifest_round_trips_with_target() {
+        let message = ClientMessage::Manifest {
+            room_id: "room-123".to_string(),
+            manifest: r#"{"files":[{"name":"demo.bin","size":1024}]}"#.to_string(),
+            target: Some("peer-456".to_string()),
+        };
+
+        let value = serde_json::to_value(&message).expect("serialize manifest");
+        assert_eq!(value["type"], "Manifest");
+        assert_eq!(value["payload"]["room_id"], "room-123");
+        assert_eq!(value["payload"]["target"], "peer-456");
+
+        let decoded: ClientMessage = serde_json::from_value(value).expect("deserialize manifest");
+        match decoded {
+            ClientMessage::Manifest {
+                room_id,
+                manifest,
+                target,
+            } => {
+                assert_eq!(room_id, "room-123");
+                assert!(manifest.contains("demo.bin"));
+                assert_eq!(target.as_deref(), Some("peer-456"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_turn_config_omits_absent_credentials() {
+        let message = ServerMessage::TurnConfig {
+            success: true,
+            data: Some(TurnConfigData {
+                ice_servers: vec![IceServer {
+                    urls: vec!["stun:stun.example.com:3478".to_string()],
+                    username: None,
+                    credential: None,
+                    credential_type: None,
+                }],
+                ttl: 600,
+                timestamp: 1_700_000_000,
+                room_id: "room-123".to_string(),
+            }),
+            error: None,
+        };
+
+        let value = serde_json::to_value(&message).expect("serialize turn config");
+        let ice_server = &value["payload"]["data"]["ice_servers"][0];
+
+        assert_eq!(value["type"], "TurnConfig");
+        assert_eq!(ice_server["urls"][0], "stun:stun.example.com:3478");
+        assert!(ice_server.get("username").is_none());
+        assert!(ice_server.get("credential").is_none());
+        assert!(ice_server.get("credential_type").is_none());
+    }
 }
