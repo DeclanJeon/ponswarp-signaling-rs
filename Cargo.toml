@@ -22,6 +22,9 @@ aws-sdk-s3 = { version = "1", features = ["http-1x"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Database (optional Cloud Drop persistence)
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json"] }
+
 # Thread-safe Collections
 dashmap = "6"
 

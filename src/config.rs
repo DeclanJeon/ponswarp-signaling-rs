@@ -9,10 +9,19 @@ pub struct Config {
     pub host: String,
     #[allow(dead_code)]
     pub cors_origins: Vec<String>,
+    pub database: DatabaseConfig,
     pub room: RoomConfig,
     pub turn: TurnConfig,
     pub cloud: CloudConfig,
     pub log_level: String,
+}
+
+/// 선택적 Postgres 설정
+#[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    pub url: String,
+    pub max_connections: u32,
+    pub run_migrations: bool,
 }
 
 /// 방 설정
@@ -49,6 +58,7 @@ pub struct TurnPorts {
 #[derive(Debug, Clone)]
 pub struct CloudConfig {
     pub enabled: bool,
+    pub billing_enabled: bool,
     pub bucket: String,
     pub endpoint: String,
     pub access_key_id: String,
@@ -59,6 +69,7 @@ pub struct CloudConfig {
     pub upload_url_ttl_seconds: u64,
     pub download_url_ttl_seconds: u64,
     pub cleanup_interval_seconds: u64,
+    pub cleanup_run_on_startup: bool,
     pub max_files: usize,
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
@@ -108,6 +119,18 @@ impl Config {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
+            database: DatabaseConfig {
+                url: env::var("DATABASE_URL")
+                    .or_else(|_| env::var("POSTGRES_URL"))
+                    .unwrap_or_default(),
+                max_connections: env::var("DATABASE_MAX_CONNECTIONS")
+                    .unwrap_or_else(|_| "5".to_string())
+                    .parse()
+                    .unwrap_or(5),
+                run_migrations: env::var("DATABASE_RUN_MIGRATIONS")
+                    .map(|v| v != "false")
+                    .unwrap_or(true),
+            },
             room: RoomConfig {
                 max_size: env::var("MAX_ROOM_SIZE")
                     .unwrap_or_else(|_| "4".to_string())
@@ -158,6 +181,9 @@ impl Config {
             },
             cloud: CloudConfig {
                 enabled: cloud_enabled,
+                billing_enabled: env::var("PONSWARP_BILLING_ENABLED")
+                    .map(|v| v == "true")
+                    .unwrap_or(false),
                 bucket: r2_bucket,
                 endpoint: r2_endpoint,
                 access_key_id: r2_access_key,
@@ -184,6 +210,10 @@ impl Config {
                     .unwrap_or_else(|_| "300".to_string())
                     .parse()
                     .unwrap_or(300),
+                cleanup_run_on_startup: env::var("PONSWARP_CLOUD_CLEANUP_RUN_ON_STARTUP")
+                    .or_else(|_| env::var("R2_CLEANUP_RUN_ON_STARTUP"))
+                    .map(|v| v != "false")
+                    .unwrap_or(true),
                 max_files: env::var("PONSWARP_CLOUD_MAX_FILES")
                     .unwrap_or_else(|_| "100".to_string())
                     .parse()

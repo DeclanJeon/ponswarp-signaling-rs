@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -18,6 +19,10 @@ use uuid::Uuid;
 pub struct CreateCloudShareRequest {
     pub root_name: String,
     pub files: Vec<CreateCloudFileRequest>,
+    pub entitlement_token: Option<String>,
+    pub retention_seconds: Option<u64>,
+    pub password: Option<String>,
+    pub download_limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +113,53 @@ pub struct PublicCloudFile {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CloudPlansResponse {
+    pub direct_p2p: DirectP2pPlan,
+    pub free: CloudPlanLimit,
+    pub passes: Vec<DropPassPlan>,
+    pub pro: ProPlan,
+    pub checkout_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectP2pPlan {
+    pub label: String,
+    pub unlimited: bool,
+    pub price_krw: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudPlanLimit {
+    pub sku: String,
+    pub label: String,
+    pub price_krw: u64,
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+    pub retention_seconds: u64,
+    pub download_limit: Option<u32>,
+    pub available: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropPassPlan {
+    #[serde(flatten)]
+    pub limit: CloudPlanLimit,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProPlan {
+    #[serde(flatten)]
+    pub limit: CloudPlanLimit,
+    pub monthly_quota_bytes: u64,
+    pub concurrent_storage_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ApiErrorBody {
     error: String,
 }
@@ -120,6 +172,10 @@ pub async fn create_cloud_share(
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+pub async fn get_cloud_plans(State(state): State<Arc<AppState>>) -> Json<CloudPlansResponse> {
+    Json(cloud_plans_response(&state.config.cloud))
 }
 
 pub async fn get_cloud_share(
@@ -153,15 +209,166 @@ pub async fn download_cloud_file(
     }
 }
 
+fn cloud_plans_response(config: &CloudConfig) -> CloudPlansResponse {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const TB: u64 = 1024 * GB;
+
+    let billing_enabled = config.billing_enabled;
+    CloudPlansResponse {
+        direct_p2p: DirectP2pPlan {
+            label: "Direct P2P".to_string(),
+            unlimited: true,
+            price_krw: 0,
+        },
+        free: CloudPlanLimit {
+            sku: "free_cloud_10gb_24h".to_string(),
+            label: "Free Cloud Drop".to_string(),
+            price_krw: 0,
+            max_total_bytes: config.max_total_bytes,
+            max_file_bytes: config.max_file_bytes,
+            retention_seconds: config.retention_seconds,
+            download_limit: None,
+            available: true,
+        },
+        passes: vec![
+            DropPassPlan {
+                limit: CloudPlanLimit {
+                    sku: "drop_100gb_3d".to_string(),
+                    label: "100GB Drop Pass".to_string(),
+                    price_krw: 1_900,
+                    max_total_bytes: 100 * GB,
+                    max_file_bytes: 100 * GB,
+                    retention_seconds: 3 * 24 * 60 * 60,
+                    download_limit: Some(10),
+                    available: billing_enabled,
+                },
+            },
+            DropPassPlan {
+                limit: CloudPlanLimit {
+                    sku: "drop_500gb_7d".to_string(),
+                    label: "500GB Drop Pass".to_string(),
+                    price_krw: 4_900,
+                    max_total_bytes: 500 * GB,
+                    max_file_bytes: 500 * GB,
+                    retention_seconds: 7 * 24 * 60 * 60,
+                    download_limit: Some(20),
+                    available: billing_enabled,
+                },
+            },
+            DropPassPlan {
+                limit: CloudPlanLimit {
+                    sku: "drop_1tb_7d".to_string(),
+                    label: "1TB Drop Pass".to_string(),
+                    price_krw: 9_900,
+                    max_total_bytes: TB,
+                    max_file_bytes: TB,
+                    retention_seconds: 7 * 24 * 60 * 60,
+                    download_limit: Some(30),
+                    available: billing_enabled,
+                },
+            },
+        ],
+        pro: ProPlan {
+            limit: CloudPlanLimit {
+                sku: "pro_monthly_krw_9900".to_string(),
+                label: "PonsWarp Pro".to_string(),
+                price_krw: 9_900,
+                max_total_bytes: TB,
+                max_file_bytes: TB,
+                retention_seconds: 7 * 24 * 60 * 60,
+                download_limit: Some(30),
+                available: billing_enabled,
+            },
+            monthly_quota_bytes: 2 * TB,
+            concurrent_storage_bytes: TB,
+        },
+        checkout_enabled: billing_enabled,
+    }
+}
+
+struct ResolvedCloudPolicy {
+    retention_seconds: u64,
+    plan_snapshot: serde_json::Value,
+    password_hash: Option<String>,
+    download_limit: Option<u32>,
+}
+
+impl From<ResolvedCloudPolicy> for crate::database::CloudSharePolicyRecord {
+    fn from(policy: ResolvedCloudPolicy) -> Self {
+        Self {
+            plan_snapshot: policy.plan_snapshot,
+            owner_user_id: None,
+            drop_pass_id: None,
+            password_hash: policy.password_hash,
+            download_limit: policy.download_limit,
+        }
+    }
+}
+
+fn resolve_cloud_policy(
+    config: &CloudConfig,
+    request: &CreateCloudShareRequest,
+) -> Result<ResolvedCloudPolicy, CloudShareError> {
+    if request
+        .entitlement_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty())
+    {
+        return Err(CloudShareError::bad_request(
+            "Paid Cloud Drop checkout is not available yet",
+        ));
+    }
+
+    if request
+        .password
+        .as_deref()
+        .is_some_and(|password| !password.trim().is_empty())
+    {
+        return Err(CloudShareError::bad_request(
+            "Password-protected Cloud Drop links are not available yet",
+        ));
+    }
+
+    if request.download_limit.is_some() {
+        return Err(CloudShareError::bad_request(
+            "Download limits are not available yet",
+        ));
+    }
+
+    let retention_seconds = request
+        .retention_seconds
+        .unwrap_or(config.retention_seconds)
+        .clamp(1, config.retention_seconds);
+
+    Ok(ResolvedCloudPolicy {
+        retention_seconds,
+        plan_snapshot: free_plan_snapshot(config, retention_seconds),
+        password_hash: None,
+        download_limit: None,
+    })
+}
+
+fn free_plan_snapshot(config: &CloudConfig, retention_seconds: u64) -> serde_json::Value {
+    json!({
+        "sku": "free_cloud_10gb_24h",
+        "label": "Free Cloud Drop",
+        "priceKrw": 0,
+        "maxTotalBytes": config.max_total_bytes,
+        "maxFileBytes": config.max_file_bytes,
+        "retentionSeconds": retention_seconds
+    })
+}
+
 async fn create_cloud_share_inner(
     state: Arc<AppState>,
     request: CreateCloudShareRequest,
 ) -> Result<CreateCloudShareResponse, CloudShareError> {
     let storage = state.cloud_storage()?;
     validate_create_request(&state.config.cloud, &request)?;
+    let policy = resolve_cloud_policy(&state.config.cloud, &request)?;
 
     let now = unix_now();
-    let expires_at = now + state.config.cloud.retention_seconds;
+    let expires_at = now + policy.retention_seconds;
     let share_id = Uuid::new_v4().simple().to_string();
     let root_name = clamp_name(&request.root_name, "Cloud Drop");
 
@@ -214,7 +421,20 @@ async fn create_cloud_share_inner(
         files: manifest_files,
     };
 
-    write_manifest(storage, &manifest).await?;
+    if let Some(database) = state.cloud_db.as_ref() {
+        database
+            .insert_cloud_share(&manifest, policy.into())
+            .await
+            .map_err(CloudShareError::internal)?;
+    }
+    if let Err(error) = write_manifest(storage, &manifest).await {
+        if let Some(database) = state.cloud_db.as_ref() {
+            let _ = database
+                .mark_cloud_share_deleted(&manifest.share_id, unix_now())
+                .await;
+        }
+        return Err(error);
+    }
 
     Ok(CreateCloudShareResponse {
         share_url: format!("/cloud/{}", share_id),
@@ -231,7 +451,7 @@ async fn complete_cloud_share_inner(
     request: CompleteCloudShareRequest,
 ) -> Result<PublicCloudShareResponse, CloudShareError> {
     let storage = state.cloud_storage()?;
-    let mut manifest = read_manifest(storage, share_id).await?;
+    let mut manifest = read_share_manifest(&state, storage, share_id).await?;
     reject_expired(&manifest)?;
 
     let expected: std::collections::HashSet<&str> =
@@ -252,6 +472,12 @@ async fn complete_cloud_share_inner(
     }
 
     manifest.completed = true;
+    if let Some(database) = state.cloud_db.as_ref() {
+        database
+            .mark_cloud_share_completed(&manifest.share_id, manifest.total_size, unix_now())
+            .await
+            .map_err(CloudShareError::internal)?;
+    }
     write_manifest(storage, &manifest).await?;
     Ok(public_share(manifest))
 }
@@ -261,7 +487,7 @@ async fn read_public_share(
     share_id: &str,
 ) -> Result<PublicCloudShareResponse, CloudShareError> {
     let storage = state.cloud_storage()?;
-    let manifest = read_manifest(storage, share_id).await?;
+    let manifest = read_share_manifest(&state, storage, share_id).await?;
     reject_expired(&manifest)?;
     Ok(public_share(manifest))
 }
@@ -272,7 +498,7 @@ async fn download_cloud_file_inner(
     file_id: &str,
 ) -> Result<Redirect, CloudShareError> {
     let storage = state.cloud_storage()?;
-    let manifest = read_manifest(storage, share_id).await?;
+    let manifest = read_share_manifest(&state, storage, share_id).await?;
     reject_expired(&manifest)?;
     if !manifest.completed {
         return Err(CloudShareError::conflict(
@@ -354,6 +580,11 @@ pub async fn cleanup_expired_cloud_shares(state: Arc<AppState>) {
                 .key(key)
                 .send()
                 .await;
+            if let Some(database) = state.cloud_db.as_ref() {
+                let _ = database
+                    .mark_cloud_share_deleted(&manifest.share_id, unix_now())
+                    .await;
+            }
             tracing::info!(share_id = %manifest.share_id, "Expired cloud share deleted");
         }
 
@@ -481,6 +712,27 @@ async fn read_manifest(
     share_id: &str,
 ) -> Result<CloudShareManifest, CloudShareError> {
     read_manifest_by_key(storage, &storage.manifest_key(share_id)).await
+}
+
+async fn read_share_manifest(
+    state: &AppState,
+    storage: &CloudStorage,
+    share_id: &str,
+) -> Result<CloudShareManifest, CloudShareError> {
+    if let Some(database) = state.cloud_db.as_ref() {
+        match database
+            .read_cloud_share(share_id)
+            .await
+            .map_err(CloudShareError::internal)?
+        {
+            Some(manifest) => return Ok(manifest),
+            None => {
+                tracing::debug!(share_id = %share_id, "Cloud share not found in DB; falling back to R2 manifest");
+            }
+        }
+    }
+
+    read_manifest(storage, share_id).await
 }
 
 async fn read_manifest_by_key(

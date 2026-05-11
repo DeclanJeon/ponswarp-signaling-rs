@@ -1,7 +1,9 @@
 //! 애플리케이션 상태 관리
 
 use crate::config::Config;
+use crate::database::CloudDatabase;
 use crate::protocol::ServerMessage;
+use anyhow::{bail, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::Client;
@@ -21,17 +23,21 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Cloudflare R2 임시 파일 공유 저장소
     pub cloud: Option<Arc<CloudStorage>>,
+    /// Optional DB-backed Cloud Drop persistence and entitlement state
+    pub cloud_db: Option<Arc<CloudDatabase>>,
 }
 
 impl AppState {
-    pub async fn new(config: Config) -> Self {
-        let cloud = CloudStorage::from_config(&config).await.map(Arc::new);
-        Self {
+    pub async fn new(config: Config) -> Result<Self> {
+        let cloud = CloudStorage::from_config(&config).await?.map(Arc::new);
+        let cloud_db = CloudDatabase::from_config(&config).await?.map(Arc::new);
+        Ok(Self {
             rooms: DashMap::new(),
             peers: DashMap::new(),
             config: Arc::new(config),
             cloud,
-        }
+            cloud_db,
+        })
     }
 
     pub fn cloud_storage(
@@ -53,19 +59,18 @@ pub struct CloudStorage {
 }
 
 impl CloudStorage {
-    async fn from_config(config: &Config) -> Option<Self> {
+    async fn from_config(config: &Config) -> Result<Option<Self>> {
         let cloud = &config.cloud;
         if !cloud.enabled {
             tracing::info!("Cloud share disabled");
-            return None;
+            return Ok(None);
         }
         if cloud.bucket.is_empty()
             || cloud.endpoint.is_empty()
             || cloud.access_key_id.is_empty()
             || cloud.secret_access_key.is_empty()
         {
-            tracing::warn!("Cloud share requested but R2 configuration is incomplete");
-            return None;
+            bail!("PONSWARP_CLOUD_ENABLED=true requires complete R2 configuration");
         }
 
         let credentials = Credentials::new(
@@ -85,11 +90,11 @@ impl CloudStorage {
             .force_path_style(true)
             .build();
 
-        Some(Self {
+        Ok(Some(Self {
             client: Client::from_conf(s3_config),
             bucket: cloud.bucket.clone(),
             prefix: cloud.prefix.trim_matches('/').to_string(),
-        })
+        }))
     }
 
     pub fn manifest_prefix(&self) -> String {

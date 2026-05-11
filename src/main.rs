@@ -1,15 +1,18 @@
 //! PonsWarp Rust 시그널링 서버
 
 mod config;
+mod database;
 mod handlers;
 mod protocol;
 mod state;
 
+use anyhow::{Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
+    http::{HeaderValue, StatusCode},
     response::{Html, IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -20,11 +23,11 @@ use protocol::{ClientMessage, ServerMessage};
 use state::AppState;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let config = Config::from_env();
 
     // 로깅 초기화
@@ -33,7 +36,7 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let state = Arc::new(AppState::new(config.clone()).await);
+    let state = Arc::new(AppState::new(config.clone()).await?);
 
     // 방 정리 스케줄러
     let cleanup_state = state.clone();
@@ -48,9 +51,14 @@ async fn main() {
     // R2 임시 공유 정리 스케줄러
     let cloud_cleanup_state = state.clone();
     let cloud_cleanup_interval_seconds = config.cloud.cleanup_interval_seconds.max(60);
+    let cloud_cleanup_run_on_startup = config.cloud.cleanup_run_on_startup;
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(cloud_cleanup_interval_seconds));
+        if cloud_cleanup_run_on_startup {
+            handlers::cleanup_expired_cloud_shares(cloud_cleanup_state.clone()).await;
+        }
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            cloud_cleanup_interval_seconds,
+        ));
         loop {
             interval.tick().await;
             handlers::cleanup_expired_cloud_shares(cloud_cleanup_state.clone()).await;
@@ -58,16 +66,15 @@ async fn main() {
     });
 
     // CORS 설정
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = cors_layer(&config)?;
 
     // 라우터 설정
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
+        .route("/ready", get(readiness_handler))
         .route("/ws", get(ws_handler))
+        .route("/api/cloud-plans", get(handlers::get_cloud_plans))
         .route("/api/cloud-share", post(handlers::create_cloud_share))
         .route("/api/cloud-share/:share_id", get(handlers::get_cloud_share))
         .route(
@@ -82,13 +89,40 @@ async fn main() {
         .with_state(state.clone());
 
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
 
     tracing::info!("🚀 PonsWarp Rust Signaling Server started");
     tracing::info!("Address: {}", addr);
     tracing::info!("WebSocket: ws://{}/ws", addr);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await.context("server failed")?;
+    Ok(())
+}
+
+fn cors_layer(config: &Config) -> Result<CorsLayer> {
+    let origins = config
+        .cors_origins
+        .iter()
+        .filter(|origin| !origin.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    let layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    if origins.iter().any(|origin| origin.trim() == "*") {
+        return Ok(layer.allow_origin(Any));
+    }
+
+    let parsed = origins
+        .into_iter()
+        .map(|origin| {
+            origin
+                .parse::<HeaderValue>()
+                .with_context(|| format!("invalid CORS origin: {origin}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(layer.allow_origin(AllowOrigin::list(parsed)))
 }
 
 async fn index_handler() -> Html<&'static str> {
@@ -106,10 +140,27 @@ async fn health_handler() -> Json<serde_json::Value> {
     }))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cloud_ready = !state.config.cloud.enabled || state.cloud.is_some();
+    let billing_ready = !state.config.cloud.billing_enabled || state.cloud_db.is_some();
+    let ready = cloud_ready && billing_ready;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "cloudShare": cloud_ready,
+            "billing": billing_ready,
+        })),
+    )
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -170,27 +221,26 @@ async fn handle_client_message(
         ClientMessage::LeaveRoom => {
             handlers::handle_leave_room(state.clone(), peer_id).await;
         }
-        ClientMessage::Offer { room_id, sdp, target } => {
-            handlers::handle_offer(
-                state.clone(),
-                peer_id,
-                &room_id,
-                &sdp,
-                target.as_deref(),
-            )
-            .await;
+        ClientMessage::Offer {
+            room_id,
+            sdp,
+            target,
+        } => {
+            handlers::handle_offer(state.clone(), peer_id, &room_id, &sdp, target.as_deref()).await;
         }
-        ClientMessage::Answer { room_id, sdp, target } => {
-            handlers::handle_answer(
-                state.clone(),
-                peer_id,
-                &room_id,
-                &sdp,
-                target.as_deref(),
-            )
-            .await;
+        ClientMessage::Answer {
+            room_id,
+            sdp,
+            target,
+        } => {
+            handlers::handle_answer(state.clone(), peer_id, &room_id, &sdp, target.as_deref())
+                .await;
         }
-        ClientMessage::IceCandidate { room_id, candidate, target } => {
+        ClientMessage::IceCandidate {
+            room_id,
+            candidate,
+            target,
+        } => {
             handlers::handle_ice_candidate(
                 state.clone(),
                 peer_id,
@@ -200,7 +250,11 @@ async fn handle_client_message(
             )
             .await;
         }
-        ClientMessage::Manifest { room_id, manifest, target } => {
+        ClientMessage::Manifest {
+            room_id,
+            manifest,
+            target,
+        } => {
             handlers::handle_manifest(
                 state.clone(),
                 peer_id,
@@ -211,27 +265,20 @@ async fn handle_client_message(
             .await;
         }
         ClientMessage::TransferReady { room_id, target } => {
-            handlers::handle_transfer_ready(
-                state.clone(),
-                peer_id,
-                &room_id,
-                target.as_deref(),
-            )
-            .await;
+            handlers::handle_transfer_ready(state.clone(), peer_id, &room_id, target.as_deref())
+                .await;
         }
         ClientMessage::TransferComplete { room_id, target } => {
-            handlers::handle_transfer_complete(
-                state.clone(),
-                peer_id,
-                &room_id,
-                target.as_deref(),
-            )
-            .await;
+            handlers::handle_transfer_complete(state.clone(), peer_id, &room_id, target.as_deref())
+                .await;
         }
         ClientMessage::RequestTurnConfig { room_id, .. } => {
             handlers::handle_turn_config_request(state.clone(), sender, &room_id).await;
         }
-        ClientMessage::RefreshTurnCredentials { room_id, current_username } => {
+        ClientMessage::RefreshTurnCredentials {
+            room_id,
+            current_username,
+        } => {
             if handlers::validate_credentials(&current_username) {
                 let _ = sender.send(ServerMessage::TurnConfig {
                     success: true,
