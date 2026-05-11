@@ -78,12 +78,16 @@ CORS_ORIGINS=https://warp.ponslink.com
 PONSWARP_BILLING_ENABLED=false
 
 # 유료화/권한/사용량 기록을 켤 때 필요합니다.
+PONSWARP_PUBLIC_APP_URL=https://warp.ponslink.com
+STRIPE_SECRET_KEY=sk_live_...
+STRIPE_WEBHOOK_SECRET=whsec_...
 DATABASE_URL=postgres://ponswarp:password@127.0.0.1:5432/ponswarp
 DATABASE_MAX_CONNECTIONS=5
 DATABASE_RUN_MIGRATIONS=true
 ```
 
-`GET /ready`는 운영 헬스체크에 사용할 수 있습니다. 현재 서버는 결제 API를 아직 제공하지 않으므로 `PONSWARP_BILLING_ENABLED=true`는 Stripe Checkout/webhook 구현 뒤에만 켜야 합니다.
+`GET /ready`는 운영 헬스체크에 사용할 수 있습니다. `PONSWARP_BILLING_ENABLED=true`일 때는 Postgres, Stripe secret key, Stripe webhook secret이 모두 없으면 서버가 기동에 실패합니다.
+Stripe webhook URL은 `https://warp.ponslink.com/api/billing/webhook`이며, `checkout.session.completed` 이벤트를 보내야 Drop Pass/Pro entitlement가 생성됩니다.
 
 ## 메시지 프로토콜
 

@@ -287,8 +287,13 @@ fn cloud_plans_response(config: &CloudConfig) -> CloudPlansResponse {
 }
 
 struct ResolvedCloudPolicy {
+    max_files: usize,
+    max_total_bytes: u64,
+    max_file_bytes: u64,
     retention_seconds: u64,
     plan_snapshot: serde_json::Value,
+    owner_user_id: Option<Uuid>,
+    drop_pass_id: Option<Uuid>,
     password_hash: Option<String>,
     download_limit: Option<u32>,
 }
@@ -297,28 +302,19 @@ impl From<ResolvedCloudPolicy> for crate::database::CloudSharePolicyRecord {
     fn from(policy: ResolvedCloudPolicy) -> Self {
         Self {
             plan_snapshot: policy.plan_snapshot,
-            owner_user_id: None,
-            drop_pass_id: None,
+            owner_user_id: policy.owner_user_id,
+            drop_pass_id: policy.drop_pass_id,
             password_hash: policy.password_hash,
             download_limit: policy.download_limit,
         }
     }
 }
 
-fn resolve_cloud_policy(
-    config: &CloudConfig,
+async fn resolve_cloud_policy(
+    state: &AppState,
     request: &CreateCloudShareRequest,
 ) -> Result<ResolvedCloudPolicy, CloudShareError> {
-    if request
-        .entitlement_token
-        .as_deref()
-        .is_some_and(|token| !token.trim().is_empty())
-    {
-        return Err(CloudShareError::bad_request(
-            "Paid Cloud Drop checkout is not available yet",
-        ));
-    }
-
+    let config = &state.config.cloud;
     if request
         .password
         .as_deref()
@@ -327,6 +323,54 @@ fn resolve_cloud_policy(
         return Err(CloudShareError::bad_request(
             "Password-protected Cloud Drop links are not available yet",
         ));
+    }
+
+    if let Some(token) = request
+        .entitlement_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        let Some(database) = state.cloud_db.as_ref() else {
+            return Err(CloudShareError::bad_request(
+                "Paid Cloud Drop requires billing database",
+            ));
+        };
+        let entitlement = database
+            .resolve_entitlement(token.trim(), unix_now())
+            .await
+            .map_err(CloudShareError::internal)?
+            .ok_or_else(|| CloudShareError::bad_request("Cloud Drop entitlement is not active"))?;
+
+        let retention_seconds = request
+            .retention_seconds
+            .unwrap_or(entitlement.retention_seconds)
+            .clamp(1, entitlement.retention_seconds);
+        let download_limit = match (request.download_limit, entitlement.download_limit) {
+            (Some(requested), Some(maximum)) => Some(requested.clamp(1, maximum)),
+            (Some(requested), None) => Some(requested),
+            (None, maximum) => maximum,
+        };
+
+        return Ok(ResolvedCloudPolicy {
+            max_files: config.max_files,
+            max_total_bytes: entitlement.max_total_bytes,
+            max_file_bytes: entitlement.max_file_bytes,
+            retention_seconds,
+            plan_snapshot: json!({
+                "sku": entitlement.sku,
+                "label": entitlement.label,
+                "maxTotalBytes": entitlement.max_total_bytes,
+                "maxFileBytes": entitlement.max_file_bytes,
+                "retentionSeconds": retention_seconds,
+                "downloadLimit": download_limit,
+                "monthlyQuotaBytes": entitlement.monthly_quota_bytes,
+                "concurrentStorageBytes": entitlement.concurrent_storage_bytes
+            }),
+            owner_user_id: entitlement.owner_user_id,
+            drop_pass_id: entitlement.drop_pass_id,
+            password_hash: None,
+            download_limit,
+        });
     }
 
     if request.download_limit.is_some() {
@@ -341,8 +385,13 @@ fn resolve_cloud_policy(
         .clamp(1, config.retention_seconds);
 
     Ok(ResolvedCloudPolicy {
+        max_files: config.max_files,
+        max_total_bytes: config.max_total_bytes,
+        max_file_bytes: config.max_file_bytes,
         retention_seconds,
         plan_snapshot: free_plan_snapshot(config, retention_seconds),
+        owner_user_id: None,
+        drop_pass_id: None,
         password_hash: None,
         download_limit: None,
     })
@@ -364,11 +413,12 @@ async fn create_cloud_share_inner(
     request: CreateCloudShareRequest,
 ) -> Result<CreateCloudShareResponse, CloudShareError> {
     let storage = state.cloud_storage()?;
-    validate_create_request(&state.config.cloud, &request)?;
-    let policy = resolve_cloud_policy(&state.config.cloud, &request)?;
+    let policy = resolve_cloud_policy(&state, &request).await?;
+    validate_create_request(&policy, &request)?;
 
     let now = unix_now();
     let expires_at = now + policy.retention_seconds;
+    let drop_pass_to_consume = policy.drop_pass_id;
     let share_id = Uuid::new_v4().simple().to_string();
     let root_name = clamp_name(&request.root_name, "Cloud Drop");
 
@@ -434,6 +484,23 @@ async fn create_cloud_share_inner(
                 .await;
         }
         return Err(error);
+    }
+    if let Some(drop_pass_id) = drop_pass_to_consume {
+        if let Some(database) = state.cloud_db.as_ref() {
+            let consumed = database
+                .consume_drop_pass(drop_pass_id)
+                .await
+                .map_err(CloudShareError::internal)?;
+            if !consumed {
+                let _ = database
+                    .mark_cloud_share_deleted(&manifest.share_id, unix_now())
+                    .await;
+                let _ = delete_manifest(storage, &manifest.share_id).await;
+                return Err(CloudShareError::bad_request(
+                    "Cloud Drop entitlement was already used",
+                ));
+            }
+        }
     }
 
     Ok(CreateCloudShareResponse {
@@ -511,6 +578,16 @@ async fn download_cloud_file_inner(
         .iter()
         .find(|file| file.id == file_id)
         .ok_or_else(|| CloudShareError::not_found("File not found"))?;
+
+    if let Some(database) = state.cloud_db.as_ref() {
+        let allowed = database
+            .try_increment_download_count(&manifest.share_id)
+            .await
+            .map_err(CloudShareError::internal)?;
+        if !allowed {
+            return Err(CloudShareError::forbidden("Download limit reached"));
+        }
+    }
 
     let presigned = storage
         .client
@@ -597,7 +674,7 @@ pub async fn cleanup_expired_cloud_shares(state: Arc<AppState>) {
 }
 
 fn validate_create_request(
-    config: &CloudConfig,
+    policy: &ResolvedCloudPolicy,
     request: &CreateCloudShareRequest,
 ) -> Result<(), CloudShareError> {
     if request.files.is_empty() {
@@ -605,26 +682,26 @@ fn validate_create_request(
             "At least one file is required",
         ));
     }
-    if request.files.len() > config.max_files {
+    if request.files.len() > policy.max_files {
         return Err(CloudShareError::bad_request(
             "Too many files in one cloud share",
         ));
     }
     let total_size: u64 = request.files.iter().map(|file| file.size).sum();
-    if total_size > config.max_total_bytes {
+    if total_size > policy.max_total_bytes {
         return Err(CloudShareError::bad_request(format!(
             "Cloud Drop is limited to {}. Use direct P2P for unlimited transfer or split files into 10GB batches.",
-            format_bytes(config.max_total_bytes)
+            format_bytes(policy.max_total_bytes)
         )));
     }
     if request
         .files
         .iter()
-        .any(|file| file.size > config.max_file_bytes)
+        .any(|file| file.size > policy.max_file_bytes)
     {
         return Err(CloudShareError::bad_request(format!(
             "Each Cloud Drop file is limited to {}. Use direct P2P for unlimited transfer or split the file.",
-            format_bytes(config.max_file_bytes)
+            format_bytes(policy.max_file_bytes)
         )));
     }
     if request.files.iter().any(|file| file.size == 0) {
@@ -701,6 +778,18 @@ async fn write_manifest(
         .key(storage.manifest_key(&manifest.share_id))
         .content_type("application/json")
         .body(ByteStream::from(body))
+        .send()
+        .await
+        .map_err(CloudShareError::internal)?;
+    Ok(())
+}
+
+async fn delete_manifest(storage: &CloudStorage, share_id: &str) -> Result<(), CloudShareError> {
+    storage
+        .client
+        .delete_object()
+        .bucket(&storage.bucket)
+        .key(storage.manifest_key(share_id))
         .send()
         .await
         .map_err(CloudShareError::internal)?;
@@ -881,6 +970,13 @@ impl CloudShareError {
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }

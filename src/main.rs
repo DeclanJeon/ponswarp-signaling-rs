@@ -1,5 +1,6 @@
 //! PonsWarp Rust 시그널링 서버
 
+mod billing;
 mod config;
 mod database;
 mod handlers;
@@ -76,6 +77,8 @@ async fn main() -> Result<()> {
         .route("/ws", get(ws_handler))
         .route("/api/cloud-plans", get(handlers::get_cloud_plans))
         .route("/api/cloud-share", post(handlers::create_cloud_share))
+        .route("/api/billing/checkout", post(billing::create_checkout))
+        .route("/api/billing/webhook", post(billing::stripe_webhook))
         .route("/api/cloud-share/:share_id", get(handlers::get_cloud_share))
         .route(
             "/api/cloud-share/:share_id/complete",

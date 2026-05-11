@@ -10,6 +10,7 @@ pub struct Config {
     #[allow(dead_code)]
     pub cors_origins: Vec<String>,
     pub database: DatabaseConfig,
+    pub billing: BillingConfig,
     pub room: RoomConfig,
     pub turn: TurnConfig,
     pub cloud: CloudConfig,
@@ -22,6 +23,14 @@ pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
     pub run_migrations: bool,
+}
+
+/// Stripe billing 설정
+#[derive(Debug, Clone)]
+pub struct BillingConfig {
+    pub stripe_secret_key: String,
+    pub stripe_webhook_secret: String,
+    pub public_app_url: String,
 }
 
 /// 방 설정
@@ -130,6 +139,12 @@ impl Config {
                 run_migrations: env::var("DATABASE_RUN_MIGRATIONS")
                     .map(|v| v != "false")
                     .unwrap_or(true),
+            },
+            billing: BillingConfig {
+                stripe_secret_key: env::var("STRIPE_SECRET_KEY").unwrap_or_default(),
+                stripe_webhook_secret: env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default(),
+                public_app_url: env::var("PONSWARP_PUBLIC_APP_URL")
+                    .unwrap_or_else(|_| "https://warp.ponslink.com".to_string()),
             },
             room: RoomConfig {
                 max_size: env::var("MAX_ROOM_SIZE")

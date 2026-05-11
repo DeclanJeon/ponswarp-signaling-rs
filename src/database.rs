@@ -20,6 +20,32 @@ pub struct CloudSharePolicyRecord {
     pub download_limit: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EntitlementRecord {
+    pub owner_user_id: Option<Uuid>,
+    pub drop_pass_id: Option<Uuid>,
+    pub sku: String,
+    pub label: String,
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+    pub retention_seconds: u64,
+    pub download_limit: Option<u32>,
+    pub monthly_quota_bytes: Option<u64>,
+    pub concurrent_storage_bytes: Option<u64>,
+}
+
+pub struct PaidEntitlementInput<'a> {
+    pub checkout_session_id: &'a str,
+    pub email: Option<&'a str>,
+    pub sku: &'a str,
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+    pub retention_seconds: u64,
+    pub payment_intent_id: Option<&'a str>,
+    pub subscription_id: Option<&'a str>,
+    pub created_at: u64,
+}
+
 impl CloudDatabase {
     pub async fn from_config(config: &Config) -> Result<Option<Self>> {
         let database = &config.database;
@@ -125,6 +151,238 @@ impl CloudDatabase {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn try_record_stripe_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        created_at: u64,
+        processed_at: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO stripe_events (id, event_type, created_at, processed_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(event_id)
+        .bind(event_type)
+        .bind(to_i64(created_at))
+        .bind(to_i64(processed_at))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn upsert_paid_entitlement(
+        &self,
+        input: PaidEntitlementInput<'_>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let user_id = match input.email.and_then(normalize_email) {
+            Some(email) => {
+                let id = Uuid::new_v4();
+                let row = sqlx::query(
+                    r#"
+                    INSERT INTO users (id, email, created_at, plan)
+                    VALUES ($1, $2, $3, 'free')
+                    ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+                    RETURNING id
+                    "#,
+                )
+                .bind(id)
+                .bind(email)
+                .bind(to_i64(input.created_at))
+                .fetch_one(&mut *tx)
+                .await?;
+                Some(row.get::<Uuid, _>("id"))
+            }
+            None => None,
+        };
+
+        if input.sku == "pro_monthly_krw_9900" {
+            let Some(user_id) = user_id else {
+                tracing::warn!(
+                    checkout_session_id = input.checkout_session_id,
+                    "Skipping Pro entitlement without customer email"
+                );
+                tx.commit().await?;
+                return Ok(());
+            };
+            sqlx::query(
+                r#"
+                INSERT INTO subscriptions (
+                    id, user_id, stripe_subscription_id, stripe_checkout_session_id,
+                    status, current_period_start, current_period_end, created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, 'active', NULL, NULL, $5, $5)
+                ON CONFLICT (stripe_checkout_session_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+                    status = 'active',
+                    updated_at = EXCLUDED.updated_at
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(user_id)
+            .bind(input.subscription_id)
+            .bind(input.checkout_session_id)
+            .bind(to_i64(input.created_at))
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO drop_passes (
+                    id, user_id, email, stripe_payment_intent_id,
+                    stripe_checkout_session_id, sku, status, max_total_bytes,
+                    max_file_bytes, retention_seconds, remaining_uses,
+                    created_at, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9, 1, $10, $11)
+                ON CONFLICT (stripe_checkout_session_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    email = EXCLUDED.email,
+                    stripe_payment_intent_id = EXCLUDED.stripe_payment_intent_id,
+                    sku = EXCLUDED.sku,
+                    status = CASE WHEN drop_passes.status = 'consumed' THEN drop_passes.status ELSE 'active' END,
+                    max_total_bytes = EXCLUDED.max_total_bytes,
+                    max_file_bytes = EXCLUDED.max_file_bytes,
+                    retention_seconds = EXCLUDED.retention_seconds,
+                    expires_at = EXCLUDED.expires_at
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(user_id)
+            .bind(input.email.and_then(normalize_email))
+            .bind(input.payment_intent_id)
+            .bind(input.checkout_session_id)
+            .bind(input.sku)
+            .bind(to_i64(input.max_total_bytes))
+            .bind(to_i64(input.max_file_bytes))
+            .bind(to_i64(input.retention_seconds))
+            .bind(to_i64(input.created_at))
+            .bind(to_i64(input.created_at.saturating_add(30 * 24 * 60 * 60)))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn resolve_entitlement(
+        &self,
+        token: &str,
+        now: u64,
+    ) -> Result<Option<EntitlementRecord>, sqlx::Error> {
+        if let Some(row) = sqlx::query(
+            r#"
+            SELECT id, user_id, sku, max_total_bytes, max_file_bytes,
+                   retention_seconds, expires_at
+            FROM drop_passes
+            WHERE stripe_checkout_session_id = $1
+              AND status = 'active'
+              AND remaining_uses > 0
+              AND (expires_at IS NULL OR expires_at > $2)
+            "#,
+        )
+        .bind(token)
+        .bind(to_i64(now))
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            let sku: String = row.get("sku");
+            return Ok(Some(EntitlementRecord {
+                owner_user_id: row.get("user_id"),
+                drop_pass_id: Some(row.get("id")),
+                label: paid_label(&sku),
+                sku,
+                max_total_bytes: from_i64(row.get("max_total_bytes")),
+                max_file_bytes: from_i64(row.get("max_file_bytes")),
+                retention_seconds: from_i64(row.get("retention_seconds")),
+                download_limit: Some(30),
+                monthly_quota_bytes: None,
+                concurrent_storage_bytes: None,
+            }));
+        }
+
+        if let Some(row) = sqlx::query(
+            r#"
+            SELECT s.user_id, s.stripe_checkout_session_id
+            FROM subscriptions s
+            WHERE s.stripe_checkout_session_id = $1
+              AND s.status IN ('active', 'trialing')
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            const TB: u64 = 1024 * 1024 * 1024 * 1024;
+            return Ok(Some(EntitlementRecord {
+                owner_user_id: Some(row.get("user_id")),
+                drop_pass_id: None,
+                sku: "pro_monthly_krw_9900".to_string(),
+                label: "PonsWarp Pro".to_string(),
+                max_total_bytes: TB,
+                max_file_bytes: TB,
+                retention_seconds: 7 * 24 * 60 * 60,
+                download_limit: Some(30),
+                monthly_quota_bytes: Some(2 * TB),
+                concurrent_storage_bytes: Some(TB),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    pub async fn consume_drop_pass(&self, drop_pass_id: Uuid) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE drop_passes
+            SET status = 'consumed', remaining_uses = 0
+            WHERE id = $1 AND status = 'active' AND remaining_uses > 0
+            "#,
+        )
+        .bind(drop_pass_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn try_increment_download_count(&self, share_id: &str) -> Result<bool, sqlx::Error> {
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT download_limit, download_count
+            FROM cloud_shares
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(share_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(true);
+        };
+
+        let download_limit = row.get::<Option<i32>, _>("download_limit");
+        let download_count = row.get::<i32, _>("download_count");
+        if let Some(limit) = download_limit {
+            if download_count >= limit {
+                return Ok(false);
+            }
+        }
+
+        sqlx::query("UPDATE cloud_shares SET download_count = download_count + 1 WHERE id = $1")
+            .bind(share_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
     }
 
     pub async fn mark_cloud_share_completed(
@@ -249,4 +507,23 @@ fn to_i32_from_u32(value: u32) -> i32 {
 
 fn from_i64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or_default()
+}
+
+fn normalize_email(email: &str) -> Option<&str> {
+    let email = email.trim();
+    if email.is_empty() {
+        None
+    } else {
+        Some(email)
+    }
+}
+
+fn paid_label(sku: &str) -> String {
+    match sku {
+        "drop_100gb_3d" => "100GB Drop Pass",
+        "drop_500gb_7d" => "500GB Drop Pass",
+        "drop_1tb_7d" => "1TB Drop Pass",
+        _ => "Cloud Drop Pass",
+    }
+    .to_string()
 }

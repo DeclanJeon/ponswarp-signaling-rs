@@ -1,5 +1,6 @@
 //! 애플리케이션 상태 관리
 
+use crate::billing::BillingClient;
 use crate::config::Config;
 use crate::database::CloudDatabase;
 use crate::protocol::ServerMessage;
@@ -25,18 +26,22 @@ pub struct AppState {
     pub cloud: Option<Arc<CloudStorage>>,
     /// Optional DB-backed Cloud Drop persistence and entitlement state
     pub cloud_db: Option<Arc<CloudDatabase>>,
+    /// Optional Stripe billing client
+    pub billing: Option<Arc<BillingClient>>,
 }
 
 impl AppState {
     pub async fn new(config: Config) -> Result<Self> {
         let cloud = CloudStorage::from_config(&config).await?.map(Arc::new);
         let cloud_db = CloudDatabase::from_config(&config).await?.map(Arc::new);
+        let billing = BillingClient::from_config(&config)?.map(Arc::new);
         Ok(Self {
             rooms: DashMap::new(),
             peers: DashMap::new(),
             config: Arc::new(config),
             cloud,
             cloud_db,
+            billing,
         })
     }
 
