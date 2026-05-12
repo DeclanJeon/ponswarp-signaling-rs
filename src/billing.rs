@@ -610,7 +610,8 @@ fn approval_url(value: &Value) -> Result<String, BillingError> {
         .and_then(Value::as_array)
         .and_then(|links| {
             links.iter().find_map(|link| {
-                if link.get("rel").and_then(Value::as_str) == Some("approve") {
+                let rel = link.get("rel").and_then(Value::as_str);
+                if rel == Some("approve") || rel == Some("payer-action") {
                     link.get("href").and_then(Value::as_str)
                 } else {
                     None
@@ -749,6 +750,23 @@ mod tests {
         assert_eq!(
             capture_request_id("5O190127TN364715T"),
             "ponswarp-capture-5O190127TN364715T"
+        );
+    }
+
+    #[test]
+    fn approval_url_accepts_payer_action_links() {
+        let value = json!({
+            "links": [
+                {
+                    "rel": "payer-action",
+                    "href": "https://www.sandbox.paypal.com/checkoutnow?token=test"
+                }
+            ]
+        });
+
+        assert_eq!(
+            approval_url(&value).unwrap(),
+            "https://www.sandbox.paypal.com/checkoutnow?token=test"
         );
     }
 }
