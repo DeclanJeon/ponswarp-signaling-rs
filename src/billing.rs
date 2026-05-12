@@ -23,6 +23,7 @@ pub struct BillingClient {
     client_secret: String,
     webhook_id: String,
     api_base: String,
+    currency: String,
     pro_plan_id: String,
     public_app_url: String,
 }
@@ -98,6 +99,7 @@ impl BillingClient {
                 .paypal_api_base
                 .trim_end_matches('/')
                 .to_string(),
+            currency: config.billing.paypal_currency.to_uppercase(),
             pro_plan_id: config.billing.paypal_pro_plan_id.clone(),
             public_app_url: config
                 .billing
@@ -141,8 +143,8 @@ impl BillingClient {
                 "custom_id": plan.sku,
                 "description": plan.label,
                 "amount": {
-                    "currency_code": "KRW",
-                    "value": plan.price_krw.to_string(),
+                    "currency_code": self.currency.as_str(),
+                    "value": plan.paypal_amount(&self.currency),
                 },
             }],
             "application_context": {
@@ -541,6 +543,16 @@ fn paid_plan(sku: &str) -> Option<PaidPlan> {
     }
 }
 
+impl PaidPlan {
+    fn paypal_amount(&self, currency: &str) -> String {
+        match currency {
+            "KRW" => self.price_krw.to_string(),
+            "USD" => format!("{:.2}", self.price_krw as f64 / 1000.0),
+            _ => self.price_krw.to_string(),
+        }
+    }
+}
+
 fn approval_url(value: &Value) -> Result<String, BillingError> {
     value
         .get("links")
@@ -667,5 +679,13 @@ mod tests {
             paid_plan("pro_monthly_krw_9900").unwrap().checkout_mode,
             CheckoutMode::Subscription
         );
+    }
+
+    #[test]
+    fn paypal_amount_formats_configured_currency() {
+        let plan = paid_plan("pro_monthly_krw_9900").unwrap();
+
+        assert_eq!(plan.paypal_amount("KRW"), "9900");
+        assert_eq!(plan.paypal_amount("USD"), "9.90");
     }
 }

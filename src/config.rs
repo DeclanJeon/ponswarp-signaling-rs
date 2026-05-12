@@ -32,6 +32,7 @@ pub struct BillingConfig {
     pub paypal_client_secret: String,
     pub paypal_webhook_id: String,
     pub paypal_api_base: String,
+    pub paypal_currency: String,
     pub paypal_pro_plan_id: String,
     pub public_app_url: String,
 }
@@ -147,8 +148,14 @@ impl Config {
                 paypal_client_id: env::var("PAYPAL_CLIENT_ID").unwrap_or_default(),
                 paypal_client_secret: env::var("PAYPAL_CLIENT_SECRET").unwrap_or_default(),
                 paypal_webhook_id: env::var("PAYPAL_WEBHOOK_ID").unwrap_or_default(),
-                paypal_api_base: env::var("PAYPAL_API_BASE")
-                    .unwrap_or_else(|_| "https://api-m.paypal.com".to_string()),
+                paypal_api_base: env::var("PAYPAL_API_BASE").unwrap_or_else(|_| {
+                    match env::var("PAYPAL_ENV").unwrap_or_default().as_str() {
+                        "sandbox" => "https://api-m.sandbox.paypal.com".to_string(),
+                        _ => "https://api-m.paypal.com".to_string(),
+                    }
+                }),
+                paypal_currency: env::var("PAYPAL_DEFAULT_CURRENCY")
+                    .unwrap_or_else(|_| "KRW".to_string()),
                 paypal_pro_plan_id: env::var("PAYPAL_PRO_PLAN_ID").unwrap_or_default(),
                 public_app_url: env::var("PONSWARP_PUBLIC_APP_URL")
                     .unwrap_or_else(|_| "https://warp.ponslink.com".to_string()),
