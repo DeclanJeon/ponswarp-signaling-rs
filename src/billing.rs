@@ -53,6 +53,7 @@ enum CheckoutMode {
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutResponse {
     checkout_url: String,
+    checkout_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,7 +190,15 @@ impl BillingClient {
                 JsonPostOptions::representation(),
             )
             .await?;
-        approval_url(&value).map(|checkout_url| CheckoutResponse { checkout_url })
+        let checkout_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BillingError::internal("PayPal did not return a checkout id"))?
+            .to_string();
+        approval_url(&value).map(|checkout_url| CheckoutResponse {
+            checkout_url,
+            checkout_id,
+        })
     }
 
     async fn create_subscription_checkout(
@@ -212,7 +221,15 @@ impl BillingClient {
         let value = self
             .post_json("/v1/billing/subscriptions", &access_token, &payload)
             .await?;
-        approval_url(&value).map(|checkout_url| CheckoutResponse { checkout_url })
+        let checkout_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BillingError::internal("PayPal did not return a checkout id"))?
+            .to_string();
+        approval_url(&value).map(|checkout_url| CheckoutResponse {
+            checkout_url,
+            checkout_id,
+        })
     }
 
     async fn capture_order(
