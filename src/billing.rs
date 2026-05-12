@@ -67,6 +67,26 @@ struct BillingErrorBody {
     error: String,
 }
 
+#[derive(Default)]
+struct JsonPostOptions {
+    prefer: Option<&'static str>,
+    paypal_request_id: Option<String>,
+}
+
+impl JsonPostOptions {
+    fn representation() -> Self {
+        Self {
+            prefer: Some("return=representation"),
+            paypal_request_id: None,
+        }
+    }
+
+    fn with_request_id(mut self, request_id: String) -> Self {
+        self.paypal_request_id = Some(request_id);
+        self
+    }
+}
+
 impl BillingClient {
     pub fn from_config(config: &Config) -> Result<Option<Self>> {
         if !config.cloud.billing_enabled {
@@ -147,17 +167,27 @@ impl BillingClient {
                     "value": plan.paypal_amount(&self.currency),
                 },
             }],
-            "application_context": {
-                "brand_name": "PonsWarp",
-                "landing_page": "LOGIN",
-                "user_action": "PAY_NOW",
-                "return_url": append_query(return_url, "checkout=success"),
-                "cancel_url": append_query(return_url, "checkout=cancelled"),
+            "payment_source": {
+                "paypal": {
+                    "experience_context": {
+                        "brand_name": "PonsWarp",
+                        "landing_page": "LOGIN",
+                        "shipping_preference": "NO_SHIPPING",
+                        "user_action": "PAY_NOW",
+                        "return_url": append_query(return_url, "checkout=success"),
+                        "cancel_url": append_query(return_url, "checkout=cancelled"),
+                    },
+                },
             },
         });
 
         let value = self
-            .post_json("/v2/checkout/orders", &access_token, &payload)
+            .post_json_with_options(
+                "/v2/checkout/orders",
+                &access_token,
+                &payload,
+                JsonPostOptions::representation(),
+            )
             .await?;
         approval_url(&value).map(|checkout_url| CheckoutResponse { checkout_url })
     }
@@ -208,10 +238,11 @@ impl BillingClient {
 
         let access_token = self.access_token().await?;
         let value = self
-            .post_json(
+            .post_json_with_options(
                 &format!("/v2/checkout/orders/{}/capture", url_path(order_id)),
                 &access_token,
                 &json!({}),
+                JsonPostOptions::representation().with_request_id(capture_request_id(order_id)),
             )
             .await?;
         let status = value
@@ -332,10 +363,30 @@ impl BillingClient {
         access_token: &str,
         payload: &Value,
     ) -> Result<Value, BillingError> {
-        self.http
+        self.post_json_with_options(path, access_token, payload, JsonPostOptions::default())
+            .await
+    }
+
+    async fn post_json_with_options(
+        &self,
+        path: &str,
+        access_token: &str,
+        payload: &Value,
+        options: JsonPostOptions,
+    ) -> Result<Value, BillingError> {
+        let mut request = self
+            .http
             .post(format!("{}{}", self.api_base, path))
             .bearer_auth(access_token)
-            .json(payload)
+            .json(payload);
+        if let Some(prefer) = options.prefer {
+            request = request.header("Prefer", prefer);
+        }
+        if let Some(request_id) = options.paypal_request_id {
+            request = request.header("PayPal-Request-Id", request_id);
+        }
+
+        request
             .send()
             .await
             .map_err(BillingError::internal)?
@@ -590,6 +641,10 @@ fn url_path(value: &str) -> String {
     value.replace('/', "%2F")
 }
 
+fn capture_request_id(order_id: &str) -> String {
+    format!("ponswarp-capture-{order_id}")
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -687,5 +742,13 @@ mod tests {
 
         assert_eq!(plan.paypal_amount("KRW"), "9900");
         assert_eq!(plan.paypal_amount("USD"), "9.90");
+    }
+
+    #[test]
+    fn capture_request_id_is_stable_for_order_retries() {
+        assert_eq!(
+            capture_request_id("5O190127TN364715T"),
+            "ponswarp-capture-5O190127TN364715T"
+        );
     }
 }
