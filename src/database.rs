@@ -28,6 +28,72 @@ pub struct AdminOverviewRecord {
     pub billing_events: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdminOperationsRecord {
+    pub users: Vec<AdminUserListRecord>,
+    pub subscriptions: Vec<AdminSubscriptionListRecord>,
+    pub drop_passes: Vec<AdminDropPassListRecord>,
+    pub cloud_shares: Vec<AdminCloudShareListRecord>,
+    pub billing_events: Vec<AdminBillingEventListRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminUserListRecord {
+    pub id: String,
+    pub email: String,
+    pub name: Option<String>,
+    pub plan: String,
+    pub created_at: u64,
+    pub last_login_at: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminSubscriptionListRecord {
+    pub id: String,
+    pub email: String,
+    pub status: String,
+    pub provider_subscription_id: Option<String>,
+    pub current_period_end: Option<u64>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminDropPassListRecord {
+    pub id: String,
+    pub email: Option<String>,
+    pub sku: String,
+    pub status: String,
+    pub remaining_uses: i32,
+    pub max_total_bytes: u64,
+    pub retention_seconds: u64,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminCloudShareListRecord {
+    pub id: String,
+    pub owner_email: Option<String>,
+    pub root_name: String,
+    pub total_size: u64,
+    pub total_files: i32,
+    pub completed: bool,
+    pub download_count: i32,
+    pub download_limit: Option<i32>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub deleted_at: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminBillingEventListRecord {
+    pub provider: String,
+    pub id: String,
+    pub event_type: String,
+    pub created_at: u64,
+    pub processed_at: u64,
+}
+
 pub struct CloudSharePolicyRecord {
     pub plan_snapshot: Value,
     pub owner_user_id: Option<Uuid>,
@@ -367,6 +433,169 @@ impl CloudDatabase {
             active_cloud_shares: row.get("active_cloud_shares"),
             stored_cloud_bytes: row.get("stored_cloud_bytes"),
             billing_events: row.get("billing_events"),
+        })
+    }
+
+    pub async fn admin_operations(&self) -> Result<AdminOperationsRecord, sqlx::Error> {
+        let users = sqlx::query(
+            r#"
+            SELECT id::text, email, name, plan, created_at, last_login_at
+            FROM users
+            ORDER BY COALESCE(last_login_at, updated_at, created_at) DESC
+            LIMIT 25
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| AdminUserListRecord {
+            id: row.get("id"),
+            email: row.get("email"),
+            name: row.get("name"),
+            plan: row.get("plan"),
+            created_at: from_i64(row.get("created_at")),
+            last_login_at: row.get::<Option<i64>, _>("last_login_at").map(from_i64),
+        })
+        .collect();
+
+        let subscriptions = sqlx::query(
+            r#"
+            SELECT
+                s.id::text,
+                u.email,
+                s.status,
+                COALESCE(
+                    s.lemonsqueezy_subscription_id,
+                    s.paypal_subscription_id,
+                    s.stripe_subscription_id
+                ) AS provider_subscription_id,
+                s.current_period_end,
+                s.updated_at
+            FROM subscriptions s
+            JOIN users u ON u.id = s.user_id
+            ORDER BY s.updated_at DESC
+            LIMIT 25
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| AdminSubscriptionListRecord {
+            id: row.get("id"),
+            email: row.get("email"),
+            status: row.get("status"),
+            provider_subscription_id: row.get("provider_subscription_id"),
+            current_period_end: row
+                .get::<Option<i64>, _>("current_period_end")
+                .map(from_i64),
+            updated_at: from_i64(row.get("updated_at")),
+        })
+        .collect();
+
+        let drop_passes = sqlx::query(
+            r#"
+            SELECT
+                dp.id::text,
+                COALESCE(u.email, dp.email) AS email,
+                dp.sku,
+                dp.status,
+                dp.remaining_uses,
+                dp.max_total_bytes,
+                dp.retention_seconds,
+                dp.created_at,
+                dp.expires_at
+            FROM drop_passes dp
+            LEFT JOIN users u ON u.id = dp.user_id
+            ORDER BY dp.created_at DESC
+            LIMIT 25
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| AdminDropPassListRecord {
+            id: row.get("id"),
+            email: row.get("email"),
+            sku: row.get("sku"),
+            status: row.get("status"),
+            remaining_uses: row.get("remaining_uses"),
+            max_total_bytes: from_i64(row.get("max_total_bytes")),
+            retention_seconds: from_i64(row.get("retention_seconds")),
+            created_at: from_i64(row.get("created_at")),
+            expires_at: row.get::<Option<i64>, _>("expires_at").map(from_i64),
+        })
+        .collect();
+
+        let cloud_shares = sqlx::query(
+            r#"
+            SELECT
+                cs.id,
+                u.email AS owner_email,
+                cs.root_name,
+                cs.total_size,
+                cs.total_files,
+                cs.completed,
+                cs.download_count,
+                cs.download_limit,
+                cs.created_at,
+                cs.expires_at,
+                cs.deleted_at
+            FROM cloud_shares cs
+            LEFT JOIN users u ON u.id = cs.owner_user_id
+            ORDER BY cs.created_at DESC
+            LIMIT 25
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| AdminCloudShareListRecord {
+            id: row.get("id"),
+            owner_email: row.get("owner_email"),
+            root_name: row.get("root_name"),
+            total_size: from_i64(row.get("total_size")),
+            total_files: row.get("total_files"),
+            completed: row.get("completed"),
+            download_count: row.get("download_count"),
+            download_limit: row.get("download_limit"),
+            created_at: from_i64(row.get("created_at")),
+            expires_at: from_i64(row.get("expires_at")),
+            deleted_at: row.get::<Option<i64>, _>("deleted_at").map(from_i64),
+        })
+        .collect();
+
+        let billing_events = sqlx::query(
+            r#"
+            SELECT provider, id, event_type, created_at, processed_at
+            FROM (
+                SELECT 'paypal' AS provider, id, event_type, created_at, processed_at
+                FROM paypal_events
+                UNION ALL
+                SELECT 'lemonsqueezy' AS provider, id, event_type, created_at, processed_at
+                FROM lemonsqueezy_events
+            ) events
+            ORDER BY processed_at DESC
+            LIMIT 40
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| AdminBillingEventListRecord {
+            provider: row.get("provider"),
+            id: row.get("id"),
+            event_type: row.get("event_type"),
+            created_at: from_i64(row.get("created_at")),
+            processed_at: from_i64(row.get("processed_at")),
+        })
+        .collect();
+
+        Ok(AdminOperationsRecord {
+            users,
+            subscriptions,
+            drop_passes,
+            cloud_shares,
+            billing_events,
         })
     }
 

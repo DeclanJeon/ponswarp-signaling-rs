@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/admin/me", get(admin::me))
         .route("/api/admin/overview", get(admin::overview))
+        .route("/api/admin/operations", get(admin::operations))
         .route("/api/cloud-share", post(handlers::create_cloud_share))
         .route("/api/billing/checkout", post(billing::create_checkout))
         .route("/api/billing/capture", post(billing::capture_checkout))
