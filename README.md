@@ -34,6 +34,11 @@ cp .env.example .env
 - `GET /health` - 헬스 체크
 - `GET /ready` - 운영 readiness 체크
 - `GET /ws` - WebSocket 엔드포인트
+- `GET /api/auth/me` - 현재 로그인 세션 조회
+- `GET /api/auth/google/start` - Google OAuth 로그인 시작
+- `GET /auth/google/callback` - Google OAuth 콜백
+- `GET /api/auth/google/callback` - Google OAuth 콜백 호환 경로
+- `POST /api/auth/logout` - 현재 세션 로그아웃
 - `GET /api/cloud-plans` - Cloud Drop 무료/유료 플랜 제한 조회
 - `POST /api/cloud-share` - Cloudflare R2 24시간 공유 생성 및 업로드 URL 발급
 - `POST /api/cloud-share/:share_id/complete` - 공유 업로드 완료 처리
@@ -79,6 +84,23 @@ PONSWARP_BILLING_ENABLED=false
 
 # 유료화/권한/사용량 기록을 켤 때 필요합니다.
 PONSWARP_PUBLIC_APP_URL=https://warp.ponslink.com
+PONSWARP_PUBLIC_API_URL=https://warp.ponslink.com
+PONSWARP_DEFAULT_PAYMENT_PROVIDER=lemonsqueezy
+GOOGLE_OAUTH_CLIENT_ID=...
+GOOGLE_OAUTH_CLIENT_SECRET=...
+AUTH_SESSION_SECRET=...
+AUTH_SESSION_COOKIE_NAME=ponswarp_session
+AUTH_SESSION_TTL_SECONDS=2592000
+
+LEMONSQUEEZY_API_BASE=https://api.lemonsqueezy.com
+LEMONSQUEEZY_API_KEY=...
+LEMONSQUEEZY_STORE_ID=...
+LEMONSQUEEZY_WEBHOOK_SECRET=...
+LEMONSQUEEZY_VARIANT_DROP_100GB_3D=...
+LEMONSQUEEZY_VARIANT_DROP_500GB_7D=...
+LEMONSQUEEZY_VARIANT_DROP_1TB_7D=...
+LEMONSQUEEZY_VARIANT_PRO_MONTHLY=...
+
 PAYPAL_API_BASE=https://api-m.paypal.com
 PAYPAL_ENV=live
 PAYPAL_DEFAULT_CURRENCY=KRW
@@ -91,8 +113,9 @@ DATABASE_MAX_CONNECTIONS=5
 DATABASE_RUN_MIGRATIONS=true
 ```
 
-`GET /ready`는 운영 헬스체크에 사용할 수 있습니다. `PONSWARP_BILLING_ENABLED=true`일 때는 Postgres와 PayPal REST 앱 키, webhook id, Pro subscription plan id가 모두 없으면 서버가 기동에 실패합니다.
-PayPal webhook URL은 `https://warp.ponslink.com/api/billing/webhook`입니다. `BILLING.SUBSCRIPTION.ACTIVATED`, `BILLING.SUBSCRIPTION.CANCELLED`, `BILLING.SUBSCRIPTION.SUSPENDED`, `BILLING.SUBSCRIPTION.EXPIRED` 이벤트를 보내면 Pro entitlement 상태가 반영됩니다. 단건 Drop Pass는 PayPal 승인 복귀 후 `/api/billing/capture`에서 capture와 entitlement 발급을 완료합니다.
+`GET /ready`는 운영 헬스체크에 사용할 수 있습니다. `PONSWARP_BILLING_ENABLED=true`일 때는 Postgres와 Lemon Squeezy 또는 PayPal checkout credential 중 하나 이상이 필요합니다. 기본 결제 provider는 Lemon Squeezy이며 `PONSWARP_DEFAULT_PAYMENT_PROVIDER=paypal`로 바꿀 수 있습니다.
+유료 Cloud Drop checkout은 Google 로그인 세션이 있어야 시작됩니다. Google Cloud Console의 Web OAuth client에는 승인된 리디렉션 URI로 `https://warp.ponslink.com/auth/google/callback`을 등록해야 합니다. 로컬에서 프론트와 API 포트가 다르면 `PONSWARP_PUBLIC_APP_URL`은 프론트 Origin, `PONSWARP_PUBLIC_API_URL`은 백엔드 Origin으로 둡니다. `AUTH_SESSION_SECRET`은 운영에서 32자 이상의 난수 문자열로 설정하고 Git에 커밋하지 마세요.
+Lemon Squeezy webhook URL은 `https://warp.ponslink.com/api/billing/lemonsqueezy/webhook`입니다. `order_created`, `subscription_created`, `subscription_updated` 이벤트를 보내면 Drop Pass와 Pro entitlement 상태가 반영됩니다. PayPal webhook URL은 `https://warp.ponslink.com/api/billing/paypal/webhook`이고 기존 호환 경로로 `https://warp.ponslink.com/api/billing/webhook`도 유지됩니다.
 
 ## 메시지 프로토콜
 

@@ -1,5 +1,6 @@
 //! Cloudflare R2 backed temporary file sharing handlers.
 
+use crate::billing::{CheckoutProvider, PaymentProviderStatus};
 use crate::config::CloudConfig;
 use crate::state::{AppState, CloudStorage};
 use aws_sdk_s3::presigning::PresigningConfig;
@@ -119,6 +120,7 @@ pub struct CloudPlansResponse {
     pub passes: Vec<DropPassPlan>,
     pub pro: ProPlan,
     pub checkout_enabled: bool,
+    pub payment_providers: Vec<PaymentProviderStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,7 +177,14 @@ pub async fn create_cloud_share(
 }
 
 pub async fn get_cloud_plans(State(state): State<Arc<AppState>>) -> Json<CloudPlansResponse> {
-    Json(cloud_plans_response(&state.config.cloud))
+    Json(cloud_plans_response(
+        &state.config.cloud,
+        state
+            .billing
+            .as_ref()
+            .map(|billing| billing.payment_providers())
+            .unwrap_or_default(),
+    ))
 }
 
 pub async fn get_cloud_share(
@@ -209,11 +218,25 @@ pub async fn download_cloud_file(
     }
 }
 
-fn cloud_plans_response(config: &CloudConfig) -> CloudPlansResponse {
+fn cloud_plans_response(
+    config: &CloudConfig,
+    payment_providers: Vec<PaymentProviderStatus>,
+) -> CloudPlansResponse {
     const GB: u64 = 1024 * 1024 * 1024;
     const TB: u64 = 1024 * GB;
 
     let billing_enabled = config.billing_enabled;
+    let payment_providers = if payment_providers.is_empty() && billing_enabled {
+        vec![PaymentProviderStatus {
+            provider: CheckoutProvider::LemonSqueezy,
+            label: "Lemon Squeezy".to_string(),
+            available: false,
+            default: true,
+        }]
+    } else {
+        payment_providers
+    };
+    let checkout_enabled = payment_providers.iter().any(|provider| provider.available);
     CloudPlansResponse {
         direct_p2p: DirectP2pPlan {
             label: "Direct P2P".to_string(),
@@ -240,7 +263,7 @@ fn cloud_plans_response(config: &CloudConfig) -> CloudPlansResponse {
                     max_file_bytes: 100 * GB,
                     retention_seconds: 3 * 24 * 60 * 60,
                     download_limit: Some(10),
-                    available: billing_enabled,
+                    available: checkout_enabled,
                 },
             },
             DropPassPlan {
@@ -252,7 +275,7 @@ fn cloud_plans_response(config: &CloudConfig) -> CloudPlansResponse {
                     max_file_bytes: 500 * GB,
                     retention_seconds: 7 * 24 * 60 * 60,
                     download_limit: Some(20),
-                    available: billing_enabled,
+                    available: checkout_enabled,
                 },
             },
             DropPassPlan {
@@ -264,7 +287,7 @@ fn cloud_plans_response(config: &CloudConfig) -> CloudPlansResponse {
                     max_file_bytes: TB,
                     retention_seconds: 7 * 24 * 60 * 60,
                     download_limit: Some(30),
-                    available: billing_enabled,
+                    available: checkout_enabled,
                 },
             },
         ],
@@ -277,12 +300,13 @@ fn cloud_plans_response(config: &CloudConfig) -> CloudPlansResponse {
                 max_file_bytes: TB,
                 retention_seconds: 7 * 24 * 60 * 60,
                 download_limit: Some(30),
-                available: billing_enabled,
+                available: checkout_enabled,
             },
             monthly_quota_bytes: 2 * TB,
             concurrent_storage_bytes: TB,
         },
-        checkout_enabled: billing_enabled,
+        checkout_enabled,
+        payment_providers,
     }
 }
 

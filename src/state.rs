@@ -28,6 +28,8 @@ pub struct AppState {
     pub cloud_db: Option<Arc<CloudDatabase>>,
     /// Optional PayPal billing client
     pub billing: Option<Arc<BillingClient>>,
+    /// Shared outbound HTTP client for OAuth and provider APIs
+    pub http: reqwest::Client,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             cloud,
             cloud_db,
             billing,
+            http: reqwest::Client::new(),
         })
     }
 

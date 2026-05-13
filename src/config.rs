@@ -10,11 +10,30 @@ pub struct Config {
     #[allow(dead_code)]
     pub cors_origins: Vec<String>,
     pub database: DatabaseConfig,
+    pub auth: AuthConfig,
+    pub admin: AdminConfig,
     pub billing: BillingConfig,
     pub room: RoomConfig,
     pub turn: TurnConfig,
     pub cloud: CloudConfig,
     pub log_level: String,
+}
+
+/// 관리자 접근 설정.
+#[derive(Debug, Clone)]
+pub struct AdminConfig {
+    pub bootstrap_emails: Vec<String>,
+}
+
+/// Google OAuth and browser session settings.
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    pub google_client_id: String,
+    pub google_client_secret: String,
+    pub session_secret: String,
+    pub session_cookie_name: String,
+    pub session_ttl_seconds: u64,
+    pub public_api_url: String,
 }
 
 /// 선택적 Postgres 설정
@@ -25,9 +44,18 @@ pub struct DatabaseConfig {
     pub run_migrations: bool,
 }
 
-/// PayPal billing 설정
+/// 결제 provider 설정
 #[derive(Debug, Clone)]
 pub struct BillingConfig {
+    pub default_provider: String,
+    pub lemonsqueezy_api_key: String,
+    pub lemonsqueezy_api_base: String,
+    pub lemonsqueezy_store_id: String,
+    pub lemonsqueezy_webhook_secret: String,
+    pub lemonsqueezy_variant_drop_100gb_3d: String,
+    pub lemonsqueezy_variant_drop_500gb_7d: String,
+    pub lemonsqueezy_variant_drop_1tb_7d: String,
+    pub lemonsqueezy_variant_pro_monthly: String,
     pub paypal_client_id: String,
     pub paypal_client_secret: String,
     pub paypal_webhook_id: String,
@@ -144,7 +172,52 @@ impl Config {
                     .map(|v| v != "false")
                     .unwrap_or(true),
             },
+            auth: AuthConfig {
+                google_client_id: env::var("GOOGLE_OAUTH_CLIENT_ID").unwrap_or_default(),
+                google_client_secret: env::var("GOOGLE_OAUTH_CLIENT_SECRET").unwrap_or_default(),
+                session_secret: env::var("AUTH_SESSION_SECRET").unwrap_or_default(),
+                session_cookie_name: env::var("AUTH_SESSION_COOKIE_NAME")
+                    .unwrap_or_else(|_| "ponswarp_session".to_string()),
+                session_ttl_seconds: env::var("AUTH_SESSION_TTL_SECONDS")
+                    .unwrap_or_else(|_| "2592000".to_string())
+                    .parse()
+                    .unwrap_or(30 * 24 * 60 * 60),
+                public_api_url: env::var("PONSWARP_PUBLIC_API_URL")
+                    .or_else(|_| env::var("PONSWARP_PUBLIC_APP_URL"))
+                    .unwrap_or_else(|_| "https://warp.ponslink.com".to_string()),
+            },
+            admin: AdminConfig {
+                bootstrap_emails: env::var("ADMIN_BOOTSTRAP_EMAILS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|email| {
+                        let email = email.trim().to_lowercase();
+                        if email.is_empty() {
+                            None
+                        } else {
+                            Some(email)
+                        }
+                    })
+                    .collect(),
+            },
             billing: BillingConfig {
+                default_provider: env::var("PONSWARP_DEFAULT_PAYMENT_PROVIDER")
+                    .unwrap_or_else(|_| "lemonsqueezy".to_string())
+                    .to_lowercase(),
+                lemonsqueezy_api_key: env::var("LEMONSQUEEZY_API_KEY").unwrap_or_default(),
+                lemonsqueezy_api_base: env::var("LEMONSQUEEZY_API_BASE")
+                    .unwrap_or_else(|_| "https://api.lemonsqueezy.com".to_string()),
+                lemonsqueezy_store_id: env::var("LEMONSQUEEZY_STORE_ID").unwrap_or_default(),
+                lemonsqueezy_webhook_secret: env::var("LEMONSQUEEZY_WEBHOOK_SECRET")
+                    .unwrap_or_default(),
+                lemonsqueezy_variant_drop_100gb_3d: env::var("LEMONSQUEEZY_VARIANT_DROP_100GB_3D")
+                    .unwrap_or_default(),
+                lemonsqueezy_variant_drop_500gb_7d: env::var("LEMONSQUEEZY_VARIANT_DROP_500GB_7D")
+                    .unwrap_or_default(),
+                lemonsqueezy_variant_drop_1tb_7d: env::var("LEMONSQUEEZY_VARIANT_DROP_1TB_7D")
+                    .unwrap_or_default(),
+                lemonsqueezy_variant_pro_monthly: env::var("LEMONSQUEEZY_VARIANT_PRO_MONTHLY")
+                    .unwrap_or_default(),
                 paypal_client_id: env::var("PAYPAL_CLIENT_ID").unwrap_or_default(),
                 paypal_client_secret: env::var("PAYPAL_CLIENT_SECRET").unwrap_or_default(),
                 paypal_webhook_id: env::var("PAYPAL_WEBHOOK_ID").unwrap_or_default(),

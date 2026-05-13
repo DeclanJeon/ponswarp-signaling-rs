@@ -1,8 +1,10 @@
-//! PayPal Checkout and webhook handling for Cloud Drop entitlements.
+//! Hosted checkout and webhook handling for Cloud Drop entitlements.
 
+use crate::auth::{current_session_user, UserIdentity};
 use crate::config::Config;
 use crate::database::{
-    CloudDatabase, PayPalOrderEntitlementInput, PayPalSubscriptionEntitlementInput,
+    CloudDatabase, LemonSqueezyOrderEntitlementInput, LemonSqueezySubscriptionEntitlementInput,
+    PayPalOrderEntitlementInput, PayPalSubscriptionEntitlementInput,
 };
 use crate::state::AppState;
 use anyhow::{bail, Result};
@@ -11,21 +13,44 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 #[derive(Clone)]
 pub struct BillingClient {
     http: reqwest::Client,
+    default_provider: CheckoutProvider,
+    lemonsqueezy: Option<LemonSqueezySettings>,
+    paypal: Option<PayPalSettings>,
+    public_app_url: String,
+}
+
+#[derive(Clone)]
+struct PayPalSettings {
     client_id: String,
     client_secret: String,
     webhook_id: String,
     api_base: String,
     currency: String,
     pro_plan_id: String,
-    public_app_url: String,
+}
+
+#[derive(Clone)]
+struct LemonSqueezySettings {
+    api_key: String,
+    api_base: String,
+    store_id: String,
+    webhook_secret: String,
+    variant_drop_100gb_3d: String,
+    variant_drop_500gb_7d: String,
+    variant_drop_1tb_7d: String,
+    variant_pro_monthly: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +59,7 @@ pub struct CheckoutRequest {
     mode: CheckoutMode,
     sku: String,
     return_url: String,
+    provider: Option<CheckoutProvider>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,17 +75,34 @@ enum CheckoutMode {
     Subscription,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckoutProvider {
+    LemonSqueezy,
+    PayPal,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutResponse {
     checkout_url: String,
     checkout_id: String,
+    provider: CheckoutProvider,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureResponse {
     entitlement_token: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentProviderStatus {
+    pub provider: CheckoutProvider,
+    pub label: String,
+    pub available: bool,
+    pub default: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,30 +131,17 @@ impl JsonPostOptions {
     }
 }
 
-impl BillingClient {
-    pub fn from_config(config: &Config) -> Result<Option<Self>> {
-        if !config.cloud.billing_enabled {
-            return Ok(None);
+impl PayPalSettings {
+    fn from_config(config: &Config) -> Option<Self> {
+        if config.billing.paypal_client_id.trim().is_empty()
+            || config.billing.paypal_client_secret.trim().is_empty()
+            || config.billing.paypal_webhook_id.trim().is_empty()
+            || config.billing.paypal_pro_plan_id.trim().is_empty()
+        {
+            return None;
         }
 
-        if config.billing.paypal_client_id.trim().is_empty() {
-            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_CLIENT_ID");
-        }
-        if config.billing.paypal_client_secret.trim().is_empty() {
-            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_CLIENT_SECRET");
-        }
-        if config.billing.paypal_webhook_id.trim().is_empty() {
-            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_WEBHOOK_ID");
-        }
-        if config.billing.paypal_pro_plan_id.trim().is_empty() {
-            bail!("PONSWARP_BILLING_ENABLED=true requires PAYPAL_PRO_PLAN_ID");
-        }
-        if config.billing.public_app_url.trim().is_empty() {
-            bail!("PONSWARP_BILLING_ENABLED=true requires PONSWARP_PUBLIC_APP_URL");
-        }
-
-        Ok(Some(Self {
-            http: reqwest::Client::new(),
+        Some(Self {
             client_id: config.billing.paypal_client_id.clone(),
             client_secret: config.billing.paypal_client_secret.clone(),
             webhook_id: config.billing.paypal_webhook_id.clone(),
@@ -122,6 +152,96 @@ impl BillingClient {
                 .to_string(),
             currency: config.billing.paypal_currency.to_uppercase(),
             pro_plan_id: config.billing.paypal_pro_plan_id.clone(),
+        })
+    }
+}
+
+impl LemonSqueezySettings {
+    fn from_config(config: &Config) -> Option<Self> {
+        if config.billing.lemonsqueezy_api_key.trim().is_empty()
+            || config.billing.lemonsqueezy_store_id.trim().is_empty()
+            || config.billing.lemonsqueezy_webhook_secret.trim().is_empty()
+            || config
+                .billing
+                .lemonsqueezy_variant_drop_100gb_3d
+                .trim()
+                .is_empty()
+            || config
+                .billing
+                .lemonsqueezy_variant_drop_500gb_7d
+                .trim()
+                .is_empty()
+            || config
+                .billing
+                .lemonsqueezy_variant_drop_1tb_7d
+                .trim()
+                .is_empty()
+            || config
+                .billing
+                .lemonsqueezy_variant_pro_monthly
+                .trim()
+                .is_empty()
+        {
+            return None;
+        }
+
+        Some(Self {
+            api_key: config.billing.lemonsqueezy_api_key.clone(),
+            api_base: config
+                .billing
+                .lemonsqueezy_api_base
+                .trim_end_matches('/')
+                .to_string(),
+            store_id: config.billing.lemonsqueezy_store_id.clone(),
+            webhook_secret: config.billing.lemonsqueezy_webhook_secret.clone(),
+            variant_drop_100gb_3d: config.billing.lemonsqueezy_variant_drop_100gb_3d.clone(),
+            variant_drop_500gb_7d: config.billing.lemonsqueezy_variant_drop_500gb_7d.clone(),
+            variant_drop_1tb_7d: config.billing.lemonsqueezy_variant_drop_1tb_7d.clone(),
+            variant_pro_monthly: config.billing.lemonsqueezy_variant_pro_monthly.clone(),
+        })
+    }
+
+    fn variant_for_sku(&self, sku: &str) -> Option<&str> {
+        match sku {
+            "drop_100gb_3d" => non_empty(&self.variant_drop_100gb_3d),
+            "drop_500gb_7d" => non_empty(&self.variant_drop_500gb_7d),
+            "drop_1tb_7d" => non_empty(&self.variant_drop_1tb_7d),
+            "pro_monthly_krw_9900" => non_empty(&self.variant_pro_monthly),
+            _ => None,
+        }
+    }
+}
+
+impl BillingClient {
+    pub fn from_config(config: &Config) -> Result<Option<Self>> {
+        if !config.cloud.billing_enabled {
+            return Ok(None);
+        }
+
+        if config.billing.public_app_url.trim().is_empty() {
+            bail!("PONSWARP_BILLING_ENABLED=true requires PONSWARP_PUBLIC_APP_URL");
+        }
+
+        let configured_default_provider = parse_provider(&config.billing.default_provider)?;
+        let lemonsqueezy = LemonSqueezySettings::from_config(config);
+        let paypal = PayPalSettings::from_config(config);
+
+        if lemonsqueezy.is_none() && paypal.is_none() {
+            bail!(
+                "PONSWARP_BILLING_ENABLED=true requires Lemon Squeezy or PayPal checkout credentials"
+            );
+        }
+        let default_provider = match configured_default_provider {
+            CheckoutProvider::LemonSqueezy if lemonsqueezy.is_none() => CheckoutProvider::PayPal,
+            CheckoutProvider::PayPal if paypal.is_none() => CheckoutProvider::LemonSqueezy,
+            provider => provider,
+        };
+
+        Ok(Some(Self {
+            http: reqwest::Client::new(),
+            default_provider,
+            lemonsqueezy,
+            paypal,
             public_app_url: config
                 .billing
                 .public_app_url
@@ -130,9 +250,27 @@ impl BillingClient {
         }))
     }
 
+    pub fn payment_providers(&self) -> Vec<PaymentProviderStatus> {
+        vec![
+            PaymentProviderStatus {
+                provider: CheckoutProvider::LemonSqueezy,
+                label: "Lemon Squeezy".to_string(),
+                available: self.lemonsqueezy.is_some(),
+                default: self.default_provider == CheckoutProvider::LemonSqueezy,
+            },
+            PaymentProviderStatus {
+                provider: CheckoutProvider::PayPal,
+                label: "PayPal".to_string(),
+                available: self.paypal.is_some(),
+                default: self.default_provider == CheckoutProvider::PayPal,
+            },
+        ]
+    }
+
     async fn create_checkout(
         &self,
         request: CheckoutRequest,
+        user: &UserIdentity,
     ) -> Result<CheckoutResponse, BillingError> {
         let plan = paid_plan(&request.sku)
             .ok_or_else(|| BillingError::bad_request("Unknown Cloud Drop plan"))?;
@@ -142,30 +280,140 @@ impl BillingClient {
             ));
         }
         let return_url = self.validate_return_url(&request.return_url)?;
+        let provider = request.provider.unwrap_or(self.default_provider);
 
-        match request.mode {
-            CheckoutMode::Payment => self.create_order_checkout(plan, &return_url).await,
-            CheckoutMode::Subscription => {
-                self.create_subscription_checkout(plan, &return_url).await
+        match provider {
+            CheckoutProvider::LemonSqueezy => {
+                self.create_lemonsqueezy_checkout(plan, &return_url, user)
+                    .await
             }
+            CheckoutProvider::PayPal => match request.mode {
+                CheckoutMode::Payment => self.create_order_checkout(plan, &return_url, user).await,
+                CheckoutMode::Subscription => {
+                    self.create_subscription_checkout(plan, &return_url, user)
+                        .await
+                }
+            },
         }
+    }
+
+    async fn create_lemonsqueezy_checkout(
+        &self,
+        plan: PaidPlan,
+        return_url: &str,
+        user: &UserIdentity,
+    ) -> Result<CheckoutResponse, BillingError> {
+        let Some(settings) = self.lemonsqueezy.as_ref() else {
+            return Err(BillingError::unavailable(
+                "Lemon Squeezy checkout is not configured",
+            ));
+        };
+        let variant_id = settings.variant_for_sku(plan.sku).ok_or_else(|| {
+            BillingError::unavailable("Lemon Squeezy variant is not configured for this plan")
+        })?;
+        let checkout_ref = Uuid::new_v4().simple().to_string();
+        let checkout_return_url = append_query(
+            &append_query(return_url, "checkout=success"),
+            &format!(
+                "provider=lemonsqueezy&checkout_id={}",
+                url_query_value(&checkout_ref)
+            ),
+        );
+        let payload = json!({
+            "data": {
+                "type": "checkouts",
+                "attributes": {
+                    "product_options": {
+                        "name": plan.label,
+                        "description": "PonsWarp Cloud Drop",
+                        "redirect_url": checkout_return_url,
+                        "receipt_button_text": "Return to PonsWarp",
+                        "receipt_link_url": checkout_return_url
+                    },
+                    "checkout_options": {
+                        "embed": false,
+                        "media": false,
+                        "logo": true,
+                        "desc": true,
+                        "discount": true,
+                        "subscription_preview": true
+                    },
+                    "checkout_data": {
+                        "email": user.email.as_str(),
+                        "custom": {
+                            "checkout_ref": checkout_ref.as_str(),
+                            "sku": plan.sku,
+                            "mode": plan.checkout_mode.as_str(),
+                            "user_id": user.id.to_string()
+                        }
+                    }
+                },
+                "relationships": {
+                    "store": {
+                        "data": {
+                            "type": "stores",
+                            "id": settings.store_id.as_str()
+                        }
+                    },
+                    "variant": {
+                        "data": {
+                            "type": "variants",
+                            "id": variant_id
+                        }
+                    }
+                }
+            }
+        });
+
+        let value: Value = self
+            .http
+            .post(format!("{}/v1/checkouts", settings.api_base))
+            .bearer_auth(&settings.api_key)
+            .header("Accept", "application/vnd.api+json")
+            .header("Content-Type", "application/vnd.api+json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(BillingError::internal)?
+            .error_for_status()
+            .map_err(BillingError::internal)?
+            .json()
+            .await
+            .map_err(BillingError::internal)?;
+
+        let checkout_url = value
+            .pointer("/data/attributes/url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BillingError::internal("Lemon Squeezy did not return a checkout URL"))?
+            .to_string();
+        Ok(CheckoutResponse {
+            checkout_url,
+            checkout_id: checkout_ref,
+            provider: CheckoutProvider::LemonSqueezy,
+        })
     }
 
     async fn create_order_checkout(
         &self,
         plan: PaidPlan,
         return_url: &str,
+        user: &UserIdentity,
     ) -> Result<CheckoutResponse, BillingError> {
-        let access_token = self.access_token().await?;
+        let Some(settings) = self.paypal.as_ref() else {
+            return Err(BillingError::unavailable(
+                "PayPal checkout is not configured",
+            ));
+        };
+        let access_token = self.access_token(settings).await?;
         let payload = json!({
             "intent": "CAPTURE",
             "purchase_units": [{
                 "reference_id": plan.sku,
-                "custom_id": plan.sku,
+                "custom_id": user.id.to_string(),
                 "description": plan.label,
                 "amount": {
-                    "currency_code": self.currency.as_str(),
-                    "value": plan.paypal_amount(&self.currency),
+                    "currency_code": settings.currency.as_str(),
+                    "value": plan.paypal_amount(&settings.currency),
                 },
             }],
             "payment_source": {
@@ -198,6 +446,7 @@ impl BillingClient {
         approval_url(&value).map(|checkout_url| CheckoutResponse {
             checkout_url,
             checkout_id,
+            provider: CheckoutProvider::PayPal,
         })
     }
 
@@ -205,11 +454,17 @@ impl BillingClient {
         &self,
         plan: PaidPlan,
         return_url: &str,
+        user: &UserIdentity,
     ) -> Result<CheckoutResponse, BillingError> {
-        let access_token = self.access_token().await?;
+        let Some(settings) = self.paypal.as_ref() else {
+            return Err(BillingError::unavailable(
+                "PayPal checkout is not configured",
+            ));
+        };
+        let access_token = self.access_token(settings).await?;
         let payload = json!({
-            "plan_id": self.pro_plan_id.as_str(),
-            "custom_id": plan.sku,
+            "plan_id": settings.pro_plan_id.as_str(),
+            "custom_id": subscription_custom_id(plan.sku, user.id),
             "application_context": {
                 "brand_name": "PonsWarp",
                 "user_action": "SUBSCRIBE_NOW",
@@ -229,6 +484,7 @@ impl BillingClient {
         approval_url(&value).map(|checkout_url| CheckoutResponse {
             checkout_url,
             checkout_id,
+            provider: CheckoutProvider::PayPal,
         })
     }
 
@@ -236,6 +492,7 @@ impl BillingClient {
         &self,
         database: &CloudDatabase,
         order_id: &str,
+        user: &UserIdentity,
     ) -> Result<CaptureResponse, BillingError> {
         let order_id = order_id.trim();
         if order_id.is_empty() {
@@ -253,7 +510,12 @@ impl BillingClient {
             });
         }
 
-        let access_token = self.access_token().await?;
+        let Some(settings) = self.paypal.as_ref() else {
+            return Err(BillingError::unavailable(
+                "PayPal checkout is not configured",
+            ));
+        };
+        let access_token = self.access_token(settings).await?;
         let value = self
             .post_json_with_options(
                 &format!("/v2/checkout/orders/{}/capture", url_path(order_id)),
@@ -294,15 +556,12 @@ impl BillingClient {
             .pointer("/payments/captures/0/id")
             .and_then(Value::as_str)
             .ok_or_else(|| BillingError::bad_request("PayPal order is missing capture id"))?;
-        let email = value
-            .pointer("/payer/email_address")
-            .and_then(Value::as_str);
-
         database
             .upsert_paypal_order_entitlement(PayPalOrderEntitlementInput {
                 paypal_order_id: order_id,
                 paypal_capture_id: capture_id,
-                email,
+                user_id: Some(user.id),
+                email: Some(user.email.as_str()),
                 sku: plan.sku,
                 max_total_bytes: plan.max_total_bytes,
                 max_file_bytes: plan.max_file_bytes,
@@ -322,14 +581,19 @@ impl BillingClient {
         headers: &HeaderMap,
         event: &Value,
     ) -> Result<(), BillingError> {
-        let access_token = self.access_token().await?;
+        let Some(settings) = self.paypal.as_ref() else {
+            return Err(BillingError::unavailable(
+                "PayPal webhook is not configured",
+            ));
+        };
+        let access_token = self.access_token(settings).await?;
         let payload = json!({
             "auth_algo": required_header(headers, "paypal-auth-algo")?,
             "cert_url": required_header(headers, "paypal-cert-url")?,
             "transmission_id": required_header(headers, "paypal-transmission-id")?,
             "transmission_sig": required_header(headers, "paypal-transmission-sig")?,
             "transmission_time": required_header(headers, "paypal-transmission-time")?,
-            "webhook_id": self.webhook_id.as_str(),
+            "webhook_id": settings.webhook_id.as_str(),
             "webhook_event": event,
         });
         let value = self
@@ -352,11 +616,11 @@ impl BillingClient {
         ))
     }
 
-    async fn access_token(&self) -> Result<String, BillingError> {
+    async fn access_token(&self, settings: &PayPalSettings) -> Result<String, BillingError> {
         let value: Value = self
             .http
-            .post(format!("{}/v1/oauth2/token", self.api_base))
-            .basic_auth(&self.client_id, Some(&self.client_secret))
+            .post(format!("{}/v1/oauth2/token", settings.api_base))
+            .basic_auth(&settings.client_id, Some(&settings.client_secret))
             .form(&[("grant_type", "client_credentials")])
             .send()
             .await
@@ -391,9 +655,14 @@ impl BillingClient {
         payload: &Value,
         options: JsonPostOptions,
     ) -> Result<Value, BillingError> {
+        let Some(settings) = self.paypal.as_ref() else {
+            return Err(BillingError::unavailable(
+                "PayPal checkout is not configured",
+            ));
+        };
         let mut request = self
             .http
-            .post(format!("{}{}", self.api_base, path))
+            .post(format!("{}{}", settings.api_base, path))
             .bearer_auth(access_token)
             .json(payload);
         if let Some(prefer) = options.prefer {
@@ -423,10 +692,33 @@ impl BillingClient {
         }
         Ok(trimmed.to_string())
     }
+
+    fn validate_lemonsqueezy_webhook(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<(), BillingError> {
+        let Some(settings) = self.lemonsqueezy.as_ref() else {
+            return Err(BillingError::unavailable(
+                "Lemon Squeezy webhook is not configured",
+            ));
+        };
+        let signature = required_header(headers, "x-signature")?;
+        let mut mac = HmacSha256::new_from_slice(settings.webhook_secret.as_bytes())
+            .map_err(BillingError::internal)?;
+        mac.update(body);
+        let provided = hex_to_bytes(&signature).ok_or_else(|| {
+            BillingError::bad_webhook("Lemon Squeezy webhook signature is invalid")
+        })?;
+        mac.verify_slice(&provided).map_err(|_| {
+            BillingError::bad_webhook("Lemon Squeezy webhook signature verification failed")
+        })
+    }
 }
 
 pub async fn create_checkout(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<CheckoutRequest>,
 ) -> Response {
     let Some(billing) = state.billing.as_ref() else {
@@ -435,8 +727,16 @@ pub async fn create_checkout(
     if state.cloud_db.is_none() {
         return BillingError::unavailable("Billing database is not available").into_response();
     }
+    let user = match current_session_user(&state, &headers).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return BillingError::unauthorized("Sign in is required for paid checkout")
+                .into_response()
+        }
+        Err(error) => return error.into_response(),
+    };
 
-    match billing.create_checkout(request).await {
+    match billing.create_checkout(request, &user).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }
@@ -444,6 +744,7 @@ pub async fn create_checkout(
 
 pub async fn capture_checkout(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<CaptureRequest>,
 ) -> Response {
     let Some(billing) = state.billing.as_ref() else {
@@ -452,8 +753,19 @@ pub async fn capture_checkout(
     let Some(database) = state.cloud_db.as_ref() else {
         return BillingError::unavailable("Billing database is not available").into_response();
     };
+    let user = match current_session_user(&state, &headers).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return BillingError::unauthorized("Sign in is required for paid checkout")
+                .into_response()
+        }
+        Err(error) => return error.into_response(),
+    };
 
-    match billing.capture_order(database, &request.order_id).await {
+    match billing
+        .capture_order(database, &request.order_id, &user)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }
@@ -485,6 +797,180 @@ pub async fn paypal_webhook(
     }
 }
 
+pub async fn lemonsqueezy_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(billing) = state.billing.as_ref() else {
+        return BillingError::unavailable("Billing is not enabled").into_response();
+    };
+    let Some(database) = state.cloud_db.as_ref() else {
+        return BillingError::unavailable("Billing database is not available").into_response();
+    };
+
+    if let Err(error) = billing.validate_lemonsqueezy_webhook(&headers, &body) {
+        return error.into_response();
+    }
+    let event = match serde_json::from_slice::<Value>(&body) {
+        Ok(event) => event,
+        Err(error) => return BillingError::bad_webhook(error.to_string()).into_response(),
+    };
+
+    match process_lemonsqueezy_event(database, &headers, &event).await {
+        Ok(()) => Json(json!({ "received": true })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn process_lemonsqueezy_event(
+    database: &CloudDatabase,
+    headers: &HeaderMap,
+    event: &Value,
+) -> Result<(), BillingError> {
+    let event_type = headers
+        .get("x-event-name")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| event.pointer("/meta/event_name").and_then(Value::as_str))
+        .ok_or_else(|| BillingError::bad_webhook("Lemon Squeezy event is missing event name"))?;
+    let resource_id = event
+        .pointer("/data/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BillingError::bad_webhook("Lemon Squeezy event is missing resource id"))?;
+    let event_id = format!("{event_type}:{resource_id}");
+    let event_created = unix_now();
+
+    let is_new = database
+        .try_record_lemonsqueezy_event(&event_id, event_type, event_created, unix_now())
+        .await
+        .map_err(BillingError::internal)?;
+    if !is_new {
+        return Ok(());
+    }
+
+    match event_type {
+        "order_created" => process_lemonsqueezy_order(database, event, event_created).await?,
+        "subscription_created" | "subscription_updated" => {
+            process_lemonsqueezy_subscription(database, event, event_created).await?
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn process_lemonsqueezy_order(
+    database: &CloudDatabase,
+    event: &Value,
+    created_at: u64,
+) -> Result<(), BillingError> {
+    let status = event
+        .pointer("/data/attributes/status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status != "paid" {
+        return Ok(());
+    }
+    let sku = custom_data_string(event, "sku")
+        .ok_or_else(|| BillingError::bad_webhook("Lemon Squeezy order is missing sku"))?;
+    let Some(plan) = paid_plan(&sku) else {
+        return Err(BillingError::bad_webhook(
+            "Lemon Squeezy order has unknown sku",
+        ));
+    };
+    if plan.checkout_mode != CheckoutMode::Payment {
+        return Ok(());
+    }
+    let checkout_ref = custom_data_string(event, "checkout_ref").ok_or_else(|| {
+        BillingError::bad_webhook("Lemon Squeezy order is missing checkout reference")
+    })?;
+    let user_id =
+        custom_data_string(event, "user_id").and_then(|value| Uuid::parse_str(&value).ok());
+    let order_id = event
+        .pointer("/data/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BillingError::bad_webhook("Lemon Squeezy order is missing id"))?;
+    let email = event
+        .pointer("/data/attributes/user_email")
+        .and_then(Value::as_str);
+
+    database
+        .upsert_lemonsqueezy_order_entitlement(LemonSqueezyOrderEntitlementInput {
+            lemonsqueezy_order_id: order_id,
+            lemonsqueezy_checkout_ref: &checkout_ref,
+            user_id,
+            email,
+            sku: plan.sku,
+            max_total_bytes: plan.max_total_bytes,
+            max_file_bytes: plan.max_file_bytes,
+            retention_seconds: plan.retention_seconds,
+            created_at,
+        })
+        .await
+        .map_err(BillingError::internal)?;
+
+    Ok(())
+}
+
+async fn process_lemonsqueezy_subscription(
+    database: &CloudDatabase,
+    event: &Value,
+    created_at: u64,
+) -> Result<(), BillingError> {
+    let sku =
+        custom_data_string(event, "sku").unwrap_or_else(|| "pro_monthly_krw_9900".to_string());
+    let Some(plan) = paid_plan(&sku) else {
+        return Err(BillingError::bad_webhook(
+            "Lemon Squeezy subscription has unknown sku",
+        ));
+    };
+    if plan.checkout_mode != CheckoutMode::Subscription {
+        return Ok(());
+    }
+    let subscription_id = event
+        .pointer("/data/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BillingError::bad_webhook("Lemon Squeezy subscription is missing id"))?;
+    let raw_status = event
+        .pointer("/data/attributes/status")
+        .and_then(Value::as_str)
+        .unwrap_or("inactive");
+    let user_id =
+        custom_data_string(event, "user_id").and_then(|value| Uuid::parse_str(&value).ok());
+    let email = event
+        .pointer("/data/attributes/user_email")
+        .and_then(Value::as_str);
+    let checkout_ref = custom_data_string(event, "checkout_ref");
+    let variant_id = event
+        .pointer("/data/attributes/variant_id")
+        .and_then(value_to_string);
+    let customer_id = event
+        .pointer("/data/attributes/customer_id")
+        .and_then(value_to_string);
+    let payment_update_url = event
+        .pointer("/data/attributes/urls/update_payment_method")
+        .and_then(Value::as_str);
+
+    database
+        .upsert_lemonsqueezy_subscription_entitlement(LemonSqueezySubscriptionEntitlementInput {
+            lemonsqueezy_subscription_id: subscription_id,
+            lemonsqueezy_checkout_ref: checkout_ref.as_deref(),
+            lemonsqueezy_variant_id: variant_id.as_deref(),
+            lemonsqueezy_customer_id: customer_id.as_deref(),
+            payment_update_url,
+            status: lemonsqueezy_subscription_status(raw_status),
+            user_id,
+            email,
+            current_period_start: None,
+            current_period_end: None,
+            created_at,
+        })
+        .await
+        .map_err(BillingError::internal)?;
+
+    Ok(())
+}
+
 async fn process_paypal_event(database: &CloudDatabase, event: &Value) -> Result<(), BillingError> {
     let event_id = event
         .get("id")
@@ -514,10 +1000,11 @@ async fn process_paypal_event(database: &CloudDatabase, event: &Value) -> Result
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| BillingError::bad_webhook("PayPal subscription is missing id"))?;
-            let sku = resource
+            let custom_id = resource
                 .get("custom_id")
                 .and_then(Value::as_str)
                 .unwrap_or("pro_monthly_krw_9900");
+            let (sku, user_id) = parse_subscription_custom_id(custom_id);
             if paid_plan(sku).is_none() {
                 return Err(BillingError::bad_webhook(
                     "PayPal subscription has unknown sku",
@@ -532,6 +1019,7 @@ async fn process_paypal_event(database: &CloudDatabase, event: &Value) -> Result
                 .upsert_paypal_subscription_entitlement(PayPalSubscriptionEntitlementInput {
                     paypal_subscription_id: subscription_id,
                     paypal_plan_id,
+                    user_id,
                     email,
                     created_at: event_created,
                 })
@@ -621,6 +1109,34 @@ impl PaidPlan {
     }
 }
 
+impl CheckoutMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            CheckoutMode::Payment => "payment",
+            CheckoutMode::Subscription => "subscription",
+        }
+    }
+}
+
+fn parse_provider(value: &str) -> Result<CheckoutProvider> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "lemonsqueezy" | "lemon_squeezy" | "lemon-squeezy" | "lemon" => {
+            Ok(CheckoutProvider::LemonSqueezy)
+        }
+        "paypal" | "pay_pal" | "pay-pal" => Ok(CheckoutProvider::PayPal),
+        other => bail!("unsupported payment provider: {other}"),
+    }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn approval_url(value: &Value) -> Result<String, BillingError> {
     value
         .get("links")
@@ -655,12 +1171,80 @@ fn append_query(url: &str, query: &str) -> String {
     }
 }
 
+fn url_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
+
 fn url_path(value: &str) -> String {
     value.replace('/', "%2F")
 }
 
 fn capture_request_id(order_id: &str) -> String {
     format!("ponswarp-capture-{order_id}")
+}
+
+fn subscription_custom_id(sku: &str, user_id: uuid::Uuid) -> String {
+    format!("{sku}|{user_id}")
+}
+
+fn parse_subscription_custom_id(value: &str) -> (&str, Option<uuid::Uuid>) {
+    let Some((sku, user_id)) = value.split_once('|') else {
+        return (value, None);
+    };
+    (sku, uuid::Uuid::parse_str(user_id).ok())
+}
+
+fn custom_data_string(event: &Value, key: &str) -> Option<String> {
+    event
+        .pointer(&format!("/meta/custom_data/{key}"))
+        .and_then(value_to_string)
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn lemonsqueezy_subscription_status(status: &str) -> &'static str {
+    match status {
+        "active" | "on_trial" | "paused" => "active",
+        _ => "inactive",
+    }
+}
+
+fn hex_to_bytes(value: &str) -> Option<Vec<u8>> {
+    let value = value.trim();
+    if value.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let high = hex_value(chunk[0])?;
+        let low = hex_value(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn unix_now() -> u64 {
@@ -687,6 +1271,13 @@ impl BillingError {
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
             message: message.into(),
         }
     }

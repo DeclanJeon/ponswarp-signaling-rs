@@ -12,6 +12,22 @@ pub struct CloudDatabase {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdminMemberRecord {
+    pub role: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminOverviewRecord {
+    pub total_users: i64,
+    pub active_subscriptions: i64,
+    pub active_drop_passes: i64,
+    pub active_cloud_shares: i64,
+    pub stored_cloud_bytes: i64,
+    pub billing_events: i64,
+}
+
 pub struct CloudSharePolicyRecord {
     pub plan_snapshot: Value,
     pub owner_user_id: Option<Uuid>,
@@ -34,9 +50,26 @@ pub struct EntitlementRecord {
     pub concurrent_storage_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthUserRecord {
+    pub id: Uuid,
+    pub email: String,
+    pub name: Option<String>,
+    pub picture_url: Option<String>,
+}
+
+pub struct GoogleUserInput<'a> {
+    pub google_sub: &'a str,
+    pub email: &'a str,
+    pub name: Option<&'a str>,
+    pub picture_url: Option<&'a str>,
+    pub now: u64,
+}
+
 pub struct PayPalOrderEntitlementInput<'a> {
     pub paypal_order_id: &'a str,
     pub paypal_capture_id: &'a str,
+    pub user_id: Option<Uuid>,
     pub email: Option<&'a str>,
     pub sku: &'a str,
     pub max_total_bytes: u64,
@@ -48,7 +81,34 @@ pub struct PayPalOrderEntitlementInput<'a> {
 pub struct PayPalSubscriptionEntitlementInput<'a> {
     pub paypal_subscription_id: &'a str,
     pub paypal_plan_id: Option<&'a str>,
+    pub user_id: Option<Uuid>,
     pub email: Option<&'a str>,
+    pub created_at: u64,
+}
+
+pub struct LemonSqueezyOrderEntitlementInput<'a> {
+    pub lemonsqueezy_order_id: &'a str,
+    pub lemonsqueezy_checkout_ref: &'a str,
+    pub user_id: Option<Uuid>,
+    pub email: Option<&'a str>,
+    pub sku: &'a str,
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+    pub retention_seconds: u64,
+    pub created_at: u64,
+}
+
+pub struct LemonSqueezySubscriptionEntitlementInput<'a> {
+    pub lemonsqueezy_subscription_id: &'a str,
+    pub lemonsqueezy_checkout_ref: Option<&'a str>,
+    pub lemonsqueezy_variant_id: Option<&'a str>,
+    pub lemonsqueezy_customer_id: Option<&'a str>,
+    pub payment_update_url: Option<&'a str>,
+    pub status: &'a str,
+    pub user_id: Option<Uuid>,
+    pub email: Option<&'a str>,
+    pub current_period_start: Option<u64>,
+    pub current_period_end: Option<u64>,
     pub created_at: u64,
 }
 
@@ -78,6 +138,224 @@ impl CloudDatabase {
 
         tracing::info!("Cloud Drop database enabled");
         Ok(Some(Self { pool }))
+    }
+
+    pub async fn insert_oauth_state(
+        &self,
+        state: &str,
+        return_path: &str,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO oauth_states (state, return_path, created_at, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(state)
+        .bind(return_path)
+        .bind(to_i64(created_at))
+        .bind(to_i64(expires_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn consume_oauth_state(
+        &self,
+        state: &str,
+        now: u64,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            UPDATE oauth_states
+            SET consumed_at = $2
+            WHERE state = $1
+              AND consumed_at IS NULL
+              AND expires_at > $2
+            RETURNING return_path
+            "#,
+        )
+        .bind(state)
+        .bind(to_i64(now))
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get("return_path")))
+    }
+
+    pub async fn upsert_google_user(
+        &self,
+        input: GoogleUserInput<'_>,
+    ) -> Result<AuthUserRecord, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO users (
+                id, email, google_sub, name, picture_url, created_at,
+                updated_at, last_login_at, plan
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $6, $6, 'free')
+            ON CONFLICT (email) DO UPDATE SET
+                google_sub = EXCLUDED.google_sub,
+                name = EXCLUDED.name,
+                picture_url = EXCLUDED.picture_url,
+                updated_at = EXCLUDED.updated_at,
+                last_login_at = EXCLUDED.last_login_at
+            RETURNING id, email, name, picture_url
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(normalize_email(input.email).unwrap_or(input.email))
+        .bind(input.google_sub)
+        .bind(input.name)
+        .bind(input.picture_url)
+        .bind(to_i64(input.now))
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(auth_user_from_row(&row))
+    }
+
+    pub async fn insert_auth_session(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO auth_sessions (
+                id, user_id, token_hash, created_at, expires_at, last_seen_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $4)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(to_i64(created_at))
+        .bind(to_i64(expires_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn user_for_session(
+        &self,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<Option<AuthUserRecord>, sqlx::Error> {
+        let Some(row) = sqlx::query(
+            r#"
+            UPDATE auth_sessions s
+            SET last_seen_at = $2
+            FROM users u
+            WHERE s.token_hash = $1
+              AND s.user_id = u.id
+              AND s.revoked_at IS NULL
+              AND s.expires_at > $2
+            RETURNING u.id, u.email, u.name, u.picture_url
+            "#,
+        )
+        .bind(token_hash)
+        .bind(to_i64(now))
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(auth_user_from_row(&row)))
+    }
+
+    pub async fn revoke_auth_session(&self, token_hash: &str, now: u64) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE auth_sessions
+            SET revoked_at = $2
+            WHERE token_hash = $1 AND revoked_at IS NULL
+            "#,
+        )
+        .bind(token_hash)
+        .bind(to_i64(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn admin_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<AdminMemberRecord>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT role, status
+            FROM admin_members
+            WHERE user_id = $1 AND status = 'active'
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| AdminMemberRecord {
+            role: row.get("role"),
+            status: row.get("status"),
+        }))
+    }
+
+    pub async fn ensure_bootstrap_admin(&self, user_id: Uuid, now: u64) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO admin_members (id, user_id, role, status, created_by, created_at, updated_at)
+            VALUES ($1, $2, 'owner', 'active', $2, $3, $3)
+            ON CONFLICT (user_id) DO UPDATE SET
+                role = CASE
+                    WHEN admin_members.role = 'owner' THEN admin_members.role
+                    ELSE EXCLUDED.role
+                END,
+                status = 'active',
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(to_i64(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn admin_overview(&self, now: u64) -> Result<AdminOverviewRecord, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM users) AS total_users,
+                (SELECT COUNT(*) FROM subscriptions WHERE status IN ('active', 'trialing')) AS active_subscriptions,
+                (SELECT COUNT(*) FROM drop_passes WHERE status = 'active' AND remaining_uses > 0 AND (expires_at IS NULL OR expires_at > $1)) AS active_drop_passes,
+                (SELECT COUNT(*) FROM cloud_shares WHERE completed = true AND deleted_at IS NULL AND expires_at > $1) AS active_cloud_shares,
+                (SELECT COALESCE(SUM(total_size), 0)::bigint FROM cloud_shares WHERE completed = true AND deleted_at IS NULL AND expires_at > $1) AS stored_cloud_bytes,
+                (
+                    (SELECT COUNT(*) FROM paypal_events) +
+                    (SELECT COUNT(*) FROM lemonsqueezy_events)
+                ) AS billing_events
+            "#,
+        )
+        .bind(to_i64(now))
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(AdminOverviewRecord {
+            total_users: row.get("total_users"),
+            active_subscriptions: row.get("active_subscriptions"),
+            active_drop_passes: row.get("active_drop_passes"),
+            active_cloud_shares: row.get("active_cloud_shares"),
+            stored_cloud_bytes: row.get("stored_cloud_bytes"),
+            billing_events: row.get("billing_events"),
+        })
     }
 
     pub async fn insert_cloud_share(
@@ -183,12 +461,39 @@ impl CloudDatabase {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn try_record_lemonsqueezy_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        created_at: u64,
+        processed_at: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO lemonsqueezy_events (id, event_type, created_at, processed_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(event_id)
+        .bind(event_type)
+        .bind(to_i64(created_at))
+        .bind(to_i64(processed_at))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn upsert_paypal_order_entitlement(
         &self,
         input: PayPalOrderEntitlementInput<'_>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let user_id = user_id_for_email(&mut tx, input.email, input.created_at).await?;
+        let user_id = match input.user_id {
+            Some(user_id) => Some(user_id),
+            None => user_id_for_email(&mut tx, input.email, input.created_at).await?,
+        };
 
         sqlx::query(
             r#"
@@ -234,16 +539,21 @@ impl CloudDatabase {
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let fallback_email;
-        let email = match input.email.and_then(normalize_email) {
-            Some(email) => email,
+        let user_id = match input.user_id {
+            Some(user_id) => user_id,
             None => {
-                fallback_email = paypal_local_email(input.paypal_subscription_id);
-                &fallback_email
+                let email = match input.email.and_then(normalize_email) {
+                    Some(email) => email,
+                    None => {
+                        fallback_email = paypal_local_email(input.paypal_subscription_id);
+                        &fallback_email
+                    }
+                };
+                user_id_for_email(&mut tx, Some(email), input.created_at)
+                    .await?
+                    .expect("subscription email fallback always creates a user")
             }
         };
-        let user_id = user_id_for_email(&mut tx, Some(email), input.created_at)
-            .await?
-            .expect("subscription email fallback always creates a user");
 
         sqlx::query(
             r#"
@@ -263,6 +573,115 @@ impl CloudDatabase {
         .bind(user_id)
         .bind(input.paypal_subscription_id)
         .bind(input.paypal_plan_id)
+        .bind(to_i64(input.created_at))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn upsert_lemonsqueezy_order_entitlement(
+        &self,
+        input: LemonSqueezyOrderEntitlementInput<'_>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let user_id = match input.user_id {
+            Some(user_id) => Some(user_id),
+            None => user_id_for_email(&mut tx, input.email, input.created_at).await?,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO drop_passes (
+                id, user_id, email, lemonsqueezy_order_id, lemonsqueezy_checkout_ref,
+                sku, status, max_total_bytes, max_file_bytes,
+                retention_seconds, remaining_uses, created_at, expires_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9, 1, $10, $11)
+            ON CONFLICT (lemonsqueezy_checkout_ref) DO UPDATE SET
+                user_id = EXCLUDED.user_id,
+                email = EXCLUDED.email,
+                lemonsqueezy_order_id = EXCLUDED.lemonsqueezy_order_id,
+                sku = EXCLUDED.sku,
+                status = CASE WHEN drop_passes.status = 'consumed' THEN drop_passes.status ELSE 'active' END,
+                max_total_bytes = EXCLUDED.max_total_bytes,
+                max_file_bytes = EXCLUDED.max_file_bytes,
+                retention_seconds = EXCLUDED.retention_seconds,
+                expires_at = EXCLUDED.expires_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(input.email.and_then(normalize_email))
+        .bind(input.lemonsqueezy_order_id)
+        .bind(input.lemonsqueezy_checkout_ref)
+        .bind(input.sku)
+        .bind(to_i64(input.max_total_bytes))
+        .bind(to_i64(input.max_file_bytes))
+        .bind(to_i64(input.retention_seconds))
+        .bind(to_i64(input.created_at))
+        .bind(to_i64(input.created_at.saturating_add(30 * 24 * 60 * 60)))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn upsert_lemonsqueezy_subscription_entitlement(
+        &self,
+        input: LemonSqueezySubscriptionEntitlementInput<'_>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let fallback_email;
+        let user_id = match input.user_id {
+            Some(user_id) => user_id,
+            None => {
+                let email = match input.email.and_then(normalize_email) {
+                    Some(email) => email,
+                    None => {
+                        fallback_email =
+                            lemonsqueezy_local_email(input.lemonsqueezy_subscription_id);
+                        &fallback_email
+                    }
+                };
+                user_id_for_email(&mut tx, Some(email), input.created_at)
+                    .await?
+                    .expect("subscription email fallback always creates a user")
+            }
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO subscriptions (
+                id, user_id, lemonsqueezy_subscription_id, lemonsqueezy_checkout_ref,
+                lemonsqueezy_variant_id, lemonsqueezy_customer_id, payment_update_url,
+                status, current_period_start, current_period_end, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+            ON CONFLICT (lemonsqueezy_subscription_id) DO UPDATE SET
+                user_id = EXCLUDED.user_id,
+                lemonsqueezy_checkout_ref = COALESCE(EXCLUDED.lemonsqueezy_checkout_ref, subscriptions.lemonsqueezy_checkout_ref),
+                lemonsqueezy_variant_id = EXCLUDED.lemonsqueezy_variant_id,
+                lemonsqueezy_customer_id = EXCLUDED.lemonsqueezy_customer_id,
+                payment_update_url = EXCLUDED.payment_update_url,
+                status = EXCLUDED.status,
+                current_period_start = EXCLUDED.current_period_start,
+                current_period_end = EXCLUDED.current_period_end,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(input.lemonsqueezy_subscription_id)
+        .bind(input.lemonsqueezy_checkout_ref)
+        .bind(input.lemonsqueezy_variant_id)
+        .bind(input.lemonsqueezy_customer_id)
+        .bind(input.payment_update_url)
+        .bind(input.status)
+        .bind(input.current_period_start.map(to_i64))
+        .bind(input.current_period_end.map(to_i64))
         .bind(to_i64(input.created_at))
         .execute(&mut *tx)
         .await?;
@@ -302,7 +721,12 @@ impl CloudDatabase {
             SELECT id, user_id, sku, max_total_bytes, max_file_bytes,
                    retention_seconds, expires_at
             FROM drop_passes
-            WHERE (paypal_order_id = $1 OR stripe_checkout_session_id = $1)
+            WHERE (
+                    paypal_order_id = $1
+                 OR stripe_checkout_session_id = $1
+                 OR lemonsqueezy_order_id = $1
+                 OR lemonsqueezy_checkout_ref = $1
+            )
               AND status = 'active'
               AND remaining_uses > 0
               AND (expires_at IS NULL OR expires_at > $2)
@@ -330,9 +754,14 @@ impl CloudDatabase {
 
         if let Some(row) = sqlx::query(
             r#"
-            SELECT s.user_id, s.paypal_subscription_id
+            SELECT s.user_id, s.paypal_subscription_id, s.lemonsqueezy_subscription_id
             FROM subscriptions s
-            WHERE (s.paypal_subscription_id = $1 OR s.stripe_checkout_session_id = $1)
+            WHERE (
+                    s.paypal_subscription_id = $1
+                 OR s.stripe_checkout_session_id = $1
+                 OR s.lemonsqueezy_subscription_id = $1
+                 OR s.lemonsqueezy_checkout_ref = $1
+            )
               AND s.status IN ('active', 'trialing')
             "#,
         )
@@ -527,6 +956,15 @@ fn from_i64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or_default()
 }
 
+fn auth_user_from_row(row: &sqlx::postgres::PgRow) -> AuthUserRecord {
+    AuthUserRecord {
+        id: row.get("id"),
+        email: row.get("email"),
+        name: row.get("name"),
+        picture_url: row.get("picture_url"),
+    }
+}
+
 fn normalize_email(email: &str) -> Option<&str> {
     let email = email.trim();
     if email.is_empty() {
@@ -568,6 +1006,14 @@ fn paypal_local_email(subscription_id: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .collect::<String>();
     format!("paypal+{}@ponswarp.local", safe_id)
+}
+
+fn lemonsqueezy_local_email(subscription_id: &str) -> String {
+    let safe_id = subscription_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    format!("lemonsqueezy+{}@ponswarp.local", safe_id)
 }
 
 fn paid_label(sku: &str) -> String {

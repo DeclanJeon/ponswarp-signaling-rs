@@ -1,5 +1,7 @@
 //! PonsWarp Rust 시그널링 서버
 
+mod admin;
+mod auth;
 mod billing;
 mod config;
 mod database;
@@ -13,7 +15,10 @@ use axum::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
-    http::{HeaderValue, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderValue, Method, StatusCode,
+    },
     response::{Html, IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -76,10 +81,22 @@ async fn main() -> Result<()> {
         .route("/ready", get(readiness_handler))
         .route("/ws", get(ws_handler))
         .route("/api/cloud-plans", get(handlers::get_cloud_plans))
+        .route("/api/auth/me", get(auth::me))
+        .route("/api/auth/google/start", get(auth::google_start))
+        .route("/api/auth/google/callback", get(auth::google_callback))
+        .route("/auth/google/callback", get(auth::google_callback))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/admin/me", get(admin::me))
+        .route("/api/admin/overview", get(admin::overview))
         .route("/api/cloud-share", post(handlers::create_cloud_share))
         .route("/api/billing/checkout", post(billing::create_checkout))
         .route("/api/billing/capture", post(billing::capture_checkout))
         .route("/api/billing/webhook", post(billing::paypal_webhook))
+        .route("/api/billing/paypal/webhook", post(billing::paypal_webhook))
+        .route(
+            "/api/billing/lemonsqueezy/webhook",
+            post(billing::lemonsqueezy_webhook),
+        )
         .route("/api/cloud-share/:share_id", get(handlers::get_cloud_share))
         .route(
             "/api/cloud-share/:share_id/complete",
@@ -112,7 +129,9 @@ fn cors_layer(config: &Config) -> Result<CorsLayer> {
         .filter(|origin| !origin.trim().is_empty())
         .collect::<Vec<_>>();
 
-    let layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
     if origins.iter().any(|origin| origin.trim() == "*") {
         return Ok(layer.allow_origin(Any));
     }
@@ -126,7 +145,9 @@ fn cors_layer(config: &Config) -> Result<CorsLayer> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(layer.allow_origin(AllowOrigin::list(parsed)))
+    Ok(layer
+        .allow_origin(AllowOrigin::list(parsed))
+        .allow_credentials(true))
 }
 
 async fn index_handler() -> Html<&'static str> {

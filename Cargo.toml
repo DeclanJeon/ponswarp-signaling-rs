@@ -32,6 +32,7 @@ dashmap = "6"
 # TURN Credentials (HMAC-SHA1)
 hmac = "0.12"
 sha1 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
 
 # Configuration
