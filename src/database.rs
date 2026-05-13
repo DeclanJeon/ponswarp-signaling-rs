@@ -51,6 +51,18 @@ pub struct EntitlementRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct CloudUsageRecord {
+    pub monthly_completed_bytes: u64,
+    pub active_reserved_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudShareAccessRecord {
+    pub password_hash: Option<String>,
+    pub download_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct AuthUserRecord {
     pub id: Uuid,
     pub email: String,
@@ -437,6 +449,82 @@ impl CloudDatabase {
         Ok(())
     }
 
+    pub async fn cloud_share_access(
+        &self,
+        share_id: &str,
+    ) -> Result<Option<CloudShareAccessRecord>, sqlx::Error> {
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT password_hash, download_limit
+            FROM cloud_shares
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(share_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(CloudShareAccessRecord {
+            password_hash: row.get("password_hash"),
+            download_limit: row
+                .get::<Option<i32>, _>("download_limit")
+                .and_then(|value| u32::try_from(value).ok()),
+        }))
+    }
+
+    pub async fn insert_cloud_download_session(
+        &self,
+        share_id: &str,
+        token_hash: &str,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO cloud_download_sessions (
+                id, share_id, token_hash, created_at, expires_at
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (token_hash) DO NOTHING
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(share_id)
+        .bind(token_hash)
+        .bind(to_i64(created_at))
+        .bind(to_i64(expires_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn cloud_download_session_exists(
+        &self,
+        share_id: &str,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT 1
+            FROM cloud_download_sessions
+            WHERE share_id = $1
+              AND token_hash = $2
+              AND expires_at > $3
+            "#,
+        )
+        .bind(share_id)
+        .bind(token_hash)
+        .bind(to_i64(now))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.is_some())
+    }
+
     pub async fn try_record_paypal_event(
         &self,
         event_id: &str,
@@ -742,11 +830,11 @@ impl CloudDatabase {
                 owner_user_id: row.get("user_id"),
                 drop_pass_id: Some(row.get("id")),
                 label: paid_label(&sku),
+                download_limit: drop_pass_download_limit(&sku),
                 sku,
                 max_total_bytes: from_i64(row.get("max_total_bytes")),
                 max_file_bytes: from_i64(row.get("max_file_bytes")),
                 retention_seconds: from_i64(row.get("retention_seconds")),
-                download_limit: Some(30),
                 monthly_quota_bytes: None,
                 concurrent_storage_bytes: None,
             }));
@@ -787,6 +875,43 @@ impl CloudDatabase {
         Ok(None)
     }
 
+    pub async fn cloud_usage_for_user(
+        &self,
+        user_id: Uuid,
+        monthly_period_start: u64,
+        now: u64,
+    ) -> Result<CloudUsageRecord, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                (
+                    SELECT COALESCE(SUM(bytes), 0)::bigint
+                    FROM cloud_usage_events
+                    WHERE user_id = $1
+                      AND event_type = 'cloud_share_completed'
+                      AND created_at >= $2
+                ) AS monthly_completed_bytes,
+                (
+                    SELECT COALESCE(SUM(total_size), 0)::bigint
+                    FROM cloud_shares
+                    WHERE owner_user_id = $1
+                      AND deleted_at IS NULL
+                      AND expires_at > $3
+                ) AS active_reserved_bytes
+            "#,
+        )
+        .bind(user_id)
+        .bind(to_i64(monthly_period_start))
+        .bind(to_i64(now))
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(CloudUsageRecord {
+            monthly_completed_bytes: from_i64(row.get("monthly_completed_bytes")),
+            active_reserved_bytes: from_i64(row.get("active_reserved_bytes")),
+        })
+    }
+
     pub async fn consume_drop_pass(&self, drop_pass_id: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
@@ -802,33 +927,69 @@ impl CloudDatabase {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn try_increment_download_count(&self, share_id: &str) -> Result<bool, sqlx::Error> {
-        let Some(row) = sqlx::query(
+    pub async fn consume_download_session(
+        &self,
+        share_id: &str,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let fresh_session = sqlx::query(
             r#"
-            SELECT download_limit, download_count
-            FROM cloud_shares
-            WHERE id = $1 AND deleted_at IS NULL
+            UPDATE cloud_download_sessions
+            SET counted_at = $3
+            WHERE share_id = $1
+              AND token_hash = $2
+              AND expires_at > $3
+              AND counted_at IS NULL
             "#,
         )
         .bind(share_id)
-        .fetch_optional(&self.pool)
-        .await?
-        else {
-            return Ok(true);
-        };
+        .bind(token_hash)
+        .bind(to_i64(now))
+        .execute(&mut *tx)
+        .await?;
 
-        let download_limit = row.get::<Option<i32>, _>("download_limit");
-        let download_count = row.get::<i32, _>("download_count");
-        if let Some(limit) = download_limit {
-            if download_count >= limit {
-                return Ok(false);
-            }
+        if fresh_session.rows_affected() == 0 {
+            let existing = sqlx::query(
+                r#"
+                SELECT 1
+                FROM cloud_download_sessions
+                WHERE share_id = $1
+                  AND token_hash = $2
+                  AND expires_at > $3
+                  AND counted_at IS NOT NULL
+                "#,
+            )
+            .bind(share_id)
+            .bind(token_hash)
+            .bind(to_i64(now))
+            .fetch_optional(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(existing.is_some());
         }
 
-        sqlx::query("UPDATE cloud_shares SET download_count = download_count + 1 WHERE id = $1")
-            .bind(share_id)
-            .execute(&self.pool)
-            .await?;
+        let share_updated = sqlx::query(
+            r#"
+            UPDATE cloud_shares
+            SET download_count = download_count + 1
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND (download_limit IS NULL OR download_count < download_limit)
+            "#,
+        )
+        .bind(share_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if share_updated.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        tx.commit().await?;
         Ok(true)
     }
 
@@ -873,11 +1034,38 @@ impl CloudDatabase {
         share_id: &str,
         deleted_at: u64,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE cloud_shares SET deleted_at = $2 WHERE id = $1")
             .bind(share_id)
             .bind(to_i64(deleted_at))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM cloud_download_sessions WHERE share_id = $1")
+            .bind(share_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn set_lemonsqueezy_subscription_status(
+        &self,
+        lemonsqueezy_subscription_id: &str,
+        status: &str,
+        updated_at: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE subscriptions
+            SET status = $2, updated_at = $3
+            WHERE lemonsqueezy_subscription_id = $1
+            "#,
+        )
+        .bind(lemonsqueezy_subscription_id)
+        .bind(status)
+        .bind(to_i64(updated_at))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1024,4 +1212,13 @@ fn paid_label(sku: &str) -> String {
         _ => "Cloud Drop Pass",
     }
     .to_string()
+}
+
+fn drop_pass_download_limit(sku: &str) -> Option<u32> {
+    match sku {
+        "drop_100gb_3d" => Some(10),
+        "drop_500gb_7d" => Some(20),
+        "drop_1tb_7d" => Some(30),
+        _ => Some(30),
+    }
 }

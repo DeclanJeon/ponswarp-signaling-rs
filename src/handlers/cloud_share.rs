@@ -5,15 +5,21 @@ use crate::config::CloudConfig;
 use crate::state::{AppState, CloudStorage};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +30,19 @@ pub struct CreateCloudShareRequest {
     pub retention_seconds: Option<u64>,
     pub password: Option<String>,
     pub download_limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudShareAccessQuery {
+    pub password: Option<String>,
+    pub download_session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudDownloadQuery {
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +117,8 @@ pub struct PublicCloudShareResponse {
     pub expires_at: u64,
     pub seconds_until_expiry: u64,
     pub completed: bool,
+    pub requires_password: bool,
+    pub download_session_token: Option<String>,
     pub files: Vec<PublicCloudFile>,
 }
 
@@ -190,8 +211,20 @@ pub async fn get_cloud_plans(State(state): State<Arc<AppState>>) -> Json<CloudPl
 pub async fn get_cloud_share(
     State(state): State<Arc<AppState>>,
     Path(share_id): Path<String>,
+    Query(query): Query<CloudShareAccessQuery>,
 ) -> Response {
-    match read_public_share(state, &share_id).await {
+    match read_public_share(state, &share_id, query).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+pub async fn access_cloud_share(
+    State(state): State<Arc<AppState>>,
+    Path(share_id): Path<String>,
+    Json(request): Json<CloudShareAccessQuery>,
+) -> Response {
+    match read_public_share(state, &share_id, request).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }
@@ -211,8 +244,9 @@ pub async fn complete_cloud_share(
 pub async fn download_cloud_file(
     State(state): State<Arc<AppState>>,
     Path((share_id, file_id)): Path<(String, String)>,
+    Query(query): Query<CloudDownloadQuery>,
 ) -> Response {
-    match download_cloud_file_inner(state, &share_id, &file_id).await {
+    match download_cloud_file_inner(state, &share_id, &file_id, query).await {
         Ok(redirect) => redirect.into_response(),
         Err(error) => error.into_response(),
     }
@@ -339,15 +373,11 @@ async fn resolve_cloud_policy(
     request: &CreateCloudShareRequest,
 ) -> Result<ResolvedCloudPolicy, CloudShareError> {
     let config = &state.config.cloud;
-    if request
+    let password = request
         .password
         .as_deref()
-        .is_some_and(|password| !password.trim().is_empty())
-    {
-        return Err(CloudShareError::bad_request(
-            "Password-protected Cloud Drop links are not available yet",
-        ));
-    }
+        .map(str::trim)
+        .filter(|password| !password.is_empty());
 
     if let Some(token) = request
         .entitlement_token
@@ -364,6 +394,11 @@ async fn resolve_cloud_policy(
             .await
             .map_err(CloudShareError::internal)?
             .ok_or_else(|| CloudShareError::bad_request("Cloud Drop entitlement is not active"))?;
+        let requested_total_size = request.files.iter().map(|file| file.size).sum::<u64>();
+        if let Some(owner_user_id) = entitlement.owner_user_id {
+            enforce_paid_usage_limits(database, owner_user_id, &entitlement, requested_total_size)
+                .await?;
+        }
 
         let retention_seconds = request
             .retention_seconds
@@ -386,15 +421,21 @@ async fn resolve_cloud_policy(
                 "maxTotalBytes": entitlement.max_total_bytes,
                 "maxFileBytes": entitlement.max_file_bytes,
                 "retentionSeconds": retention_seconds,
-                "downloadLimit": download_limit,
+            "downloadLimit": download_limit,
                 "monthlyQuotaBytes": entitlement.monthly_quota_bytes,
                 "concurrentStorageBytes": entitlement.concurrent_storage_bytes
             }),
             owner_user_id: entitlement.owner_user_id,
             drop_pass_id: entitlement.drop_pass_id,
-            password_hash: None,
+            password_hash: password.map(|value| password_hash(state, value)),
             download_limit,
         });
+    }
+
+    if password.is_some() {
+        return Err(CloudShareError::bad_request(
+            "Password-protected Cloud Drop links require a paid Cloud Drop plan",
+        ));
     }
 
     if request.download_limit.is_some() {
@@ -419,6 +460,50 @@ async fn resolve_cloud_policy(
         password_hash: None,
         download_limit: None,
     })
+}
+
+async fn enforce_paid_usage_limits(
+    database: &crate::database::CloudDatabase,
+    owner_user_id: Uuid,
+    entitlement: &crate::database::EntitlementRecord,
+    requested_total_size: u64,
+) -> Result<(), CloudShareError> {
+    if entitlement.monthly_quota_bytes.is_none() && entitlement.concurrent_storage_bytes.is_none() {
+        return Ok(());
+    }
+
+    let now = unix_now();
+    let rolling_month_start = now.saturating_sub(30 * 24 * 60 * 60);
+    let usage = database
+        .cloud_usage_for_user(owner_user_id, rolling_month_start, now)
+        .await
+        .map_err(CloudShareError::internal)?;
+
+    if let Some(monthly_quota_bytes) = entitlement.monthly_quota_bytes {
+        let next_monthly_total = usage
+            .monthly_completed_bytes
+            .saturating_add(requested_total_size);
+        if next_monthly_total > monthly_quota_bytes {
+            return Err(CloudShareError::forbidden(format!(
+                "Monthly Cloud Drop quota exceeded. {} available in the current billing window.",
+                format_bytes(monthly_quota_bytes.saturating_sub(usage.monthly_completed_bytes))
+            )));
+        }
+    }
+
+    if let Some(concurrent_storage_bytes) = entitlement.concurrent_storage_bytes {
+        let next_reserved_total = usage
+            .active_reserved_bytes
+            .saturating_add(requested_total_size);
+        if next_reserved_total > concurrent_storage_bytes {
+            return Err(CloudShareError::forbidden(format!(
+                "Concurrent Cloud Drop storage limit exceeded. {} available until older drops expire.",
+                format_bytes(concurrent_storage_bytes.saturating_sub(usage.active_reserved_bytes))
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn free_plan_snapshot(config: &CloudConfig, retention_seconds: u64) -> serde_json::Value {
@@ -472,6 +557,7 @@ async fn create_cloud_share_inner(
         let upload_url = presign_put(
             storage,
             &object_key,
+            file.size,
             state.config.cloud.upload_url_ttl_seconds,
         )
         .await?;
@@ -570,23 +656,30 @@ async fn complete_cloud_share_inner(
             .map_err(CloudShareError::internal)?;
     }
     write_manifest(storage, &manifest).await?;
-    Ok(public_share(manifest))
+    Ok(public_share(manifest, None, false))
 }
 
 async fn read_public_share(
     state: Arc<AppState>,
     share_id: &str,
+    query: CloudShareAccessQuery,
 ) -> Result<PublicCloudShareResponse, CloudShareError> {
     let storage = state.cloud_storage()?;
     let manifest = read_share_manifest(&state, storage, share_id).await?;
     reject_expired(&manifest)?;
-    Ok(public_share(manifest))
+    let access = authorize_public_access(&state, &manifest, query).await?;
+    Ok(public_share(
+        manifest,
+        access.download_session_token,
+        access.requires_password,
+    ))
 }
 
 async fn download_cloud_file_inner(
     state: Arc<AppState>,
     share_id: &str,
     file_id: &str,
+    query: CloudDownloadQuery,
 ) -> Result<Redirect, CloudShareError> {
     let storage = state.cloud_storage()?;
     let manifest = read_share_manifest(&state, storage, share_id).await?;
@@ -603,15 +696,7 @@ async fn download_cloud_file_inner(
         .find(|file| file.id == file_id)
         .ok_or_else(|| CloudShareError::not_found("File not found"))?;
 
-    if let Some(database) = state.cloud_db.as_ref() {
-        let allowed = database
-            .try_increment_download_count(&manifest.share_id)
-            .await
-            .map_err(CloudShareError::internal)?;
-        if !allowed {
-            return Err(CloudShareError::forbidden("Download limit reached"));
-        }
-    }
+    authorize_file_download(&state, &manifest, query).await?;
 
     let presigned = storage
         .client
@@ -626,7 +711,127 @@ async fn download_cloud_file_inner(
         .await
         .map_err(CloudShareError::internal)?;
 
-    Ok(Redirect::temporary(&presigned.uri().to_string()))
+    Ok(Redirect::temporary(presigned.uri()))
+}
+
+struct AuthorizedCloudAccess {
+    download_session_token: Option<String>,
+    requires_password: bool,
+}
+
+async fn authorize_public_access(
+    state: &AppState,
+    manifest: &CloudShareManifest,
+    query: CloudShareAccessQuery,
+) -> Result<AuthorizedCloudAccess, CloudShareError> {
+    let Some(database) = state.cloud_db.as_ref() else {
+        return Ok(AuthorizedCloudAccess {
+            download_session_token: None,
+            requires_password: false,
+        });
+    };
+    let Some(access) = database
+        .cloud_share_access(&manifest.share_id)
+        .await
+        .map_err(CloudShareError::internal)?
+    else {
+        return Ok(AuthorizedCloudAccess {
+            download_session_token: None,
+            requires_password: false,
+        });
+    };
+
+    let protected = access.password_hash.is_some();
+    let limited = access.download_limit.is_some();
+    if !protected && !limited {
+        return Ok(AuthorizedCloudAccess {
+            download_session_token: None,
+            requires_password: false,
+        });
+    }
+
+    if let Some(token) = query
+        .download_session_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        if database
+            .cloud_download_session_exists(
+                &manifest.share_id,
+                &token_hash(state, token),
+                unix_now(),
+            )
+            .await
+            .map_err(CloudShareError::internal)?
+        {
+            return Ok(AuthorizedCloudAccess {
+                download_session_token: Some(token.to_string()),
+                requires_password: protected,
+            });
+        }
+    }
+
+    if let Some(expected_hash) = access.password_hash.as_deref() {
+        let Some(password) = query.password.as_deref() else {
+            return Err(CloudShareError::forbidden("Password required"));
+        };
+        if !verify_password_hash(state, password, expected_hash) {
+            return Err(CloudShareError::forbidden("Invalid password"));
+        }
+    }
+
+    let token = random_token(32);
+    database
+        .insert_cloud_download_session(
+            &manifest.share_id,
+            &token_hash(state, &token),
+            unix_now(),
+            manifest.expires_at,
+        )
+        .await
+        .map_err(CloudShareError::internal)?;
+    Ok(AuthorizedCloudAccess {
+        download_session_token: Some(token),
+        requires_password: protected,
+    })
+}
+
+async fn authorize_file_download(
+    state: &AppState,
+    manifest: &CloudShareManifest,
+    query: CloudDownloadQuery,
+) -> Result<(), CloudShareError> {
+    let Some(database) = state.cloud_db.as_ref() else {
+        return Ok(());
+    };
+    let Some(access) = database
+        .cloud_share_access(&manifest.share_id)
+        .await
+        .map_err(CloudShareError::internal)?
+    else {
+        return Ok(());
+    };
+
+    let protected = access.password_hash.is_some();
+    let limited = access.download_limit.is_some();
+    if !protected && !limited {
+        return Ok(());
+    }
+
+    let token = query
+        .token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| CloudShareError::forbidden("Download session required"))?;
+    let allowed = database
+        .consume_download_session(&manifest.share_id, &token_hash(state, token), unix_now())
+        .await
+        .map_err(CloudShareError::internal)?;
+    if !allowed {
+        return Err(CloudShareError::forbidden("Download limit reached"));
+    }
+
+    Ok(())
 }
 
 pub async fn cleanup_expired_cloud_shares(state: Arc<AppState>) {
@@ -739,6 +944,7 @@ fn validate_create_request(
 async fn presign_put(
     storage: &CloudStorage,
     object_key: &str,
+    expected_size: u64,
     ttl_seconds: u64,
 ) -> Result<String, CloudShareError> {
     let presigned = storage
@@ -746,6 +952,7 @@ async fn presign_put(
         .put_object()
         .bucket(&storage.bucket)
         .key(object_key)
+        .content_length(i64::try_from(expected_size).unwrap_or(i64::MAX))
         .presigned(presign_config(ttl_seconds)?)
         .await
         .map_err(CloudShareError::internal)?;
@@ -876,7 +1083,11 @@ async fn read_manifest_by_key(
     serde_json::from_slice(&bytes).map_err(CloudShareError::internal)
 }
 
-fn public_share(manifest: CloudShareManifest) -> PublicCloudShareResponse {
+fn public_share(
+    manifest: CloudShareManifest,
+    download_session_token: Option<String>,
+    requires_password: bool,
+) -> PublicCloudShareResponse {
     let now = unix_now();
     PublicCloudShareResponse {
         share_id: manifest.share_id,
@@ -887,6 +1098,8 @@ fn public_share(manifest: CloudShareManifest) -> PublicCloudShareResponse {
         expires_at: manifest.expires_at,
         seconds_until_expiry: manifest.expires_at.saturating_sub(now),
         completed: manifest.completed,
+        requires_password,
+        download_session_token,
         files: manifest
             .files
             .into_iter()
@@ -900,6 +1113,58 @@ fn public_share(manifest: CloudShareManifest) -> PublicCloudShareResponse {
             })
             .collect(),
     }
+}
+
+fn password_hash(state: &AppState, password: &str) -> String {
+    let salt = random_token(16);
+    let digest = keyed_digest(state, &format!("{salt}:{password}"));
+    format!("hmac-sha256:v1:{salt}:{digest}")
+}
+
+fn verify_password_hash(state: &AppState, password: &str, expected: &str) -> bool {
+    let parts = expected.split(':').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "hmac-sha256" || parts[1] != "v1" {
+        return false;
+    }
+    let candidate = keyed_digest(state, &format!("{}:{password}", parts[2]));
+    constant_time_eq(candidate.as_bytes(), parts[3].as_bytes())
+}
+
+fn token_hash(state: &AppState, token: &str) -> String {
+    keyed_digest(state, token)
+}
+
+fn keyed_digest(state: &AppState, value: &str) -> String {
+    let secret = state.config.auth.session_secret.as_bytes();
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(value.as_bytes());
+    hex(mac.finalize().into_bytes().as_slice())
+}
+
+fn random_token(bytes: usize) -> String {
+    let mut data = vec![0_u8; bytes];
+    rand::thread_rng().fill_bytes(&mut data);
+    URL_SAFE_NO_PAD.encode(data)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
 }
 
 fn reject_expired(manifest: &CloudShareManifest) -> Result<(), CloudShareError> {

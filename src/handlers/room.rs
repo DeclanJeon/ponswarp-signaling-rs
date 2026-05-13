@@ -15,13 +15,10 @@ pub async fn handle_join_room(state: Arc<AppState>, peer_id: &str, room_id: &str
     // 방 가져오기 또는 생성 및 로직 처리 (스코프 제한으로 Deadlock 방지)
     let updated_users = {
         tracing::info!(room_id = %room_id, "Acquiring room lock...");
-        let room = state
-            .rooms
-            .entry(room_id.clone())
-            .or_insert_with(|| {
-                tracing::info!(room_id = %room_id, "Room created");
-                Room::new(room_id.clone())
-            });
+        let room = state.rooms.entry(room_id.clone()).or_insert_with(|| {
+            tracing::info!(room_id = %room_id, "Room created");
+            Room::new(room_id.clone())
+        });
         tracing::info!(room_id = %room_id, "Room lock acquired");
 
         // 방 인원 제한 확인 (이미 방에 있는 유저가 재접속하는 경우는 허용)
@@ -39,11 +36,11 @@ pub async fn handle_join_room(state: Arc<AppState>, peer_id: &str, room_id: &str
                 return;
             }
         }
-    
+
         // 기존 사용자 목록
         let existing_users: Vec<String> = room.users.read().await.iter().cloned().collect();
         tracing::info!(room_id = %room_id, existing_users = ?existing_users, "Got existing users");
-    
+
         // 방에 참여
         room.users.write().await.insert(peer_id.to_string());
         tracing::info!(room_id = %room_id, peer_id = %peer_id, "User inserted into room");
@@ -67,7 +64,7 @@ pub async fn handle_join_room(state: Arc<AppState>, peer_id: &str, room_id: &str
             });
             tracing::info!(peer_id = %peer_id, "Sent JoinedRoom to new user");
         }
-    
+
         // 기존 사용자들에게 새 사용자 알림
         for existing_peer_id in &existing_users {
             if let Some(session) = state.peers.get(existing_peer_id) {
@@ -78,9 +75,15 @@ pub async fn handle_join_room(state: Arc<AppState>, peer_id: &str, room_id: &str
                 tracing::info!(target = %existing_peer_id, "Sent PeerJoined notification");
             }
         }
-    
+
         // 업데이트된 사용자 목록 반환
-        let users_list = room.users.read().await.iter().cloned().collect::<Vec<String>>();
+        let users_list = room
+            .users
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>();
         users_list
     }; // 여기서 room (DashMap RefMut)이 드롭되어 락이 해제됨
 
@@ -89,11 +92,15 @@ pub async fn handle_join_room(state: Arc<AppState>, peer_id: &str, room_id: &str
     let user_count = updated_users.len();
 
     // 모든 사용자에게 업데이트된 목록 브로드캐스트 (락 해제 후 호출)
-    broadcast_to_room(&state, &room_id, ServerMessage::RoomUsers {
-        users: updated_users,
-    })
+    broadcast_to_room(
+        &state,
+        &room_id,
+        ServerMessage::RoomUsers {
+            users: updated_users,
+        },
+    )
     .await;
-    
+
     tracing::info!(room_id = %room_id, "handle_join_room completed");
 
     tracing::info!(
@@ -122,7 +129,14 @@ pub async fn leave_room_internal(state: &AppState, peer_id: &str, room_id: &str)
 
         if remaining > 0 {
             let updated_users: Vec<String> = room.users.read().await.iter().cloned().collect();
-            broadcast_to_room(state, room_id, ServerMessage::RoomUsers { users: updated_users }).await;
+            broadcast_to_room(
+                state,
+                room_id,
+                ServerMessage::RoomUsers {
+                    users: updated_users,
+                },
+            )
+            .await;
         }
 
         tracing::info!(

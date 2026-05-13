@@ -164,15 +164,11 @@ pub async fn handle_transfer_complete(
             let forward_msg = ServerMessage::TransferComplete {
                 from: from_peer_id.to_string(),
             };
-            
+
             // 🚀 [고속 중계] send로 블로킹 없이 전송 시도
             // UnboundedSender는 블로킹하지 않으므로 try_send 대신 send 사용
             if let Err(e) = peer_session.sender.send(forward_msg) {
-                tracing::warn!(
-                    "Failed to send transfer complete to {}: {}",
-                    target_id,
-                    e
-                );
+                tracing::warn!("Failed to send transfer complete to {}: {}", target_id, e);
             } else {
                 tracing::info!(
                     from = %from_peer_id,
@@ -187,9 +183,10 @@ pub async fn handle_transfer_complete(
         let room_id_owned = room_id.to_string();
         let from_peer_id_owned = from_peer_id.to_string();
         let state_clone = state.clone();
-        
+
         tokio::spawn(async move {
-            broadcast_to_room_except(&state_clone, &room_id_owned, &from_peer_id_owned, message).await;
+            broadcast_to_room_except(&state_clone, &room_id_owned, &from_peer_id_owned, message)
+                .await;
         });
     }
 

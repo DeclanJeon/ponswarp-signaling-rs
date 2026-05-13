@@ -97,7 +97,10 @@ async fn main() -> Result<()> {
             "/api/billing/lemonsqueezy/webhook",
             post(billing::lemonsqueezy_webhook),
         )
-        .route("/api/cloud-share/:share_id", get(handlers::get_cloud_share))
+        .route(
+            "/api/cloud-share/:share_id",
+            get(handlers::get_cloud_share).post(handlers::access_cloud_share),
+        )
         .route(
             "/api/cloud-share/:share_id/complete",
             post(handlers::complete_cloud_share),

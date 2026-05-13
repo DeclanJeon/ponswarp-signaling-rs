@@ -40,12 +40,13 @@ cp .env.example .env
 - `GET /api/auth/google/callback` - Google OAuth 콜백 호환 경로
 - `POST /api/auth/logout` - 현재 세션 로그아웃
 - `GET /api/cloud-plans` - Cloud Drop 무료/유료 플랜 제한 조회
-- `POST /api/cloud-share` - Cloudflare R2 24시간 공유 생성 및 업로드 URL 발급
+- `POST /api/cloud-share` - Cloudflare R2 Cloud Drop 공유 생성 및 업로드 URL 발급
 - `POST /api/cloud-share/:share_id/complete` - 공유 업로드 완료 처리
 - `GET /api/cloud-share/:share_id` - 공개 다운로드 매니페스트 조회
+- `POST /api/cloud-share/:share_id` - 비밀번호/다운로드 세션 기반 공개 매니페스트 접근
 - `GET /api/cloud-share/:share_id/files/:file_id/download` - 파일 다운로드 URL 리다이렉트
 
-### Cloudflare R2 24시간 공유
+### Cloudflare R2 Cloud Drop 공유
 
 Cloud share는 R2 S3 호환 API를 사용합니다. 아래 환경 변수를 설정하면 서버 시작 시 자동으로 활성화됩니다.
 
@@ -68,9 +69,9 @@ PONSWARP_CLOUD_MAX_FILE_BYTES=10737418240
 PONSWARP_CLOUD_MAX_TOTAL_BYTES=10737418240
 ```
 
-서버는 만료된 공유를 주기적으로 삭제합니다. 운영 환경에서는 R2 버킷 라이프사이클도 1일 만료로 같이 설정하는 것을 권장합니다.
+서버는 만료된 공유를 주기적으로 삭제합니다. 운영 환경에서는 R2 버킷 라이프사이클도 각 플랜의 보관 기간에 맞춰 같이 설정하는 것을 권장합니다.
 브라우저가 presigned PUT/GET 요청을 직접 보내므로 R2 버킷 CORS에는 프론트엔드 Origin과 `PUT`, `GET`, `HEAD` 메서드를 허용해야 합니다.
-Cloud Drop은 공유 1건당 최대 10GB입니다. 10GB를 넘는 파일은 직접 P2P 전송을 사용하거나 10GB 단위로 분할해서 공유해야 합니다.
+무료 Cloud Drop은 공유 1건당 최대 10GB/24시간입니다. 유료 Drop Pass와 Pro entitlement는 더 큰 용량, 최대 7일 보관, 비밀번호, 다운로드 세션 제한을 적용할 수 있습니다. 앱의 무제한 컨셉은 직접 P2P 전송 경로가 담당하며, Cloud Drop 한도를 넘는 파일은 직접 P2P를 사용하거나 플랜 한도 단위로 분할해야 합니다.
 
 ### 운영 안전 설정
 
@@ -115,7 +116,7 @@ DATABASE_RUN_MIGRATIONS=true
 
 `GET /ready`는 운영 헬스체크에 사용할 수 있습니다. `PONSWARP_BILLING_ENABLED=true`일 때는 Postgres와 Lemon Squeezy 또는 PayPal checkout credential 중 하나 이상이 필요합니다. 기본 결제 provider는 Lemon Squeezy이며 `PONSWARP_DEFAULT_PAYMENT_PROVIDER=paypal`로 바꿀 수 있습니다.
 유료 Cloud Drop checkout은 Google 로그인 세션이 있어야 시작됩니다. Google Cloud Console의 Web OAuth client에는 승인된 리디렉션 URI로 `https://warp.ponslink.com/auth/google/callback`을 등록해야 합니다. 로컬에서 프론트와 API 포트가 다르면 `PONSWARP_PUBLIC_APP_URL`은 프론트 Origin, `PONSWARP_PUBLIC_API_URL`은 백엔드 Origin으로 둡니다. `AUTH_SESSION_SECRET`은 운영에서 32자 이상의 난수 문자열로 설정하고 Git에 커밋하지 마세요.
-Lemon Squeezy webhook URL은 `https://warp.ponslink.com/api/billing/lemonsqueezy/webhook`입니다. `order_created`, `subscription_created`, `subscription_updated` 이벤트를 보내면 Drop Pass와 Pro entitlement 상태가 반영됩니다. PayPal webhook URL은 `https://warp.ponslink.com/api/billing/paypal/webhook`이고 기존 호환 경로로 `https://warp.ponslink.com/api/billing/webhook`도 유지됩니다.
+Lemon Squeezy webhook URL은 `https://warp.ponslink.com/api/billing/lemonsqueezy/webhook`입니다. `order_created`, `subscription_created`, `subscription_updated`, `subscription_cancelled`, `subscription_expired`, `subscription_paused`, `subscription_resumed` 이벤트를 보내면 Drop Pass와 Pro entitlement 상태가 반영됩니다. PayPal webhook URL은 `https://warp.ponslink.com/api/billing/paypal/webhook`이고 기존 호환 경로로 `https://warp.ponslink.com/api/billing/webhook`도 유지됩니다.
 
 ## 메시지 프로토콜
 

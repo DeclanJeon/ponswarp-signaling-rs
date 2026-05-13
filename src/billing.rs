@@ -853,6 +853,12 @@ async fn process_lemonsqueezy_event(
         "subscription_created" | "subscription_updated" => {
             process_lemonsqueezy_subscription(database, event, event_created).await?
         }
+        "subscription_cancelled" | "subscription_expired" | "subscription_paused" => {
+            set_lemonsqueezy_subscription_inactive(database, event, event_created).await?
+        }
+        "subscription_resumed" => {
+            process_lemonsqueezy_subscription(database, event, event_created).await?
+        }
         _ => {}
     }
 
@@ -968,6 +974,22 @@ async fn process_lemonsqueezy_subscription(
         .await
         .map_err(BillingError::internal)?;
 
+    Ok(())
+}
+
+async fn set_lemonsqueezy_subscription_inactive(
+    database: &CloudDatabase,
+    event: &Value,
+    updated_at: u64,
+) -> Result<(), BillingError> {
+    let subscription_id = event
+        .pointer("/data/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BillingError::bad_webhook("Lemon Squeezy subscription is missing id"))?;
+    database
+        .set_lemonsqueezy_subscription_status(subscription_id, "inactive", updated_at)
+        .await
+        .map_err(BillingError::internal)?;
     Ok(())
 }
 
@@ -1218,14 +1240,14 @@ fn value_to_string(value: &Value) -> Option<String> {
 
 fn lemonsqueezy_subscription_status(status: &str) -> &'static str {
     match status {
-        "active" | "on_trial" | "paused" => "active",
+        "active" | "on_trial" => "active",
         _ => "inactive",
     }
 }
 
 fn hex_to_bytes(value: &str) -> Option<Vec<u8>> {
     let value = value.trim();
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
 
