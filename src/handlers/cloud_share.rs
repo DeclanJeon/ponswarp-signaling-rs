@@ -5,6 +5,7 @@ use crate::config::CloudConfig;
 use crate::state::{AppState, CloudStorage};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -20,6 +21,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<sha2::Sha256>;
+
+const MULTIPART_UPLOAD_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+const MULTIPART_UPLOAD_PART_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: u64 = 10_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +64,37 @@ pub struct CreateCloudFileRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CompleteCloudShareRequest {
     pub uploaded_file_ids: Vec<String>,
+    #[serde(default)]
+    pub multipart_uploads: Vec<CompleteMultipartUploadRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteMultipartUploadRequest {
+    pub file_id: String,
+    pub upload_id: String,
+    pub parts: Vec<CompleteMultipartUploadPartRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteMultipartUploadPartRequest {
+    pub part_number: i32,
+    pub e_tag: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbortCloudShareUploadsRequest {
+    #[serde(default)]
+    pub multipart_uploads: Vec<AbortMultipartUploadRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbortMultipartUploadRequest {
+    pub file_id: String,
+    pub upload_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -102,6 +138,24 @@ pub struct CloudUploadTarget {
     pub id: String,
     pub name: String,
     pub path: String,
+    pub size: u64,
+    pub upload_url: Option<String>,
+    pub multipart: Option<CloudMultipartUploadTarget>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudMultipartUploadTarget {
+    pub upload_id: String,
+    pub part_size: u64,
+    pub parts: Vec<CloudMultipartUploadPart>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudMultipartUploadPart {
+    pub part_number: i32,
+    pub offset: u64,
     pub size: u64,
     pub upload_url: String,
 }
@@ -237,6 +291,17 @@ pub async fn complete_cloud_share(
 ) -> Response {
     match complete_cloud_share_inner(state, &share_id, request).await {
         Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+pub async fn abort_cloud_share_uploads(
+    State(state): State<Arc<AppState>>,
+    Path(share_id): Path<String>,
+    Json(request): Json<AbortCloudShareUploadsRequest>,
+) -> Response {
+    match abort_cloud_share_uploads_inner(state, &share_id, request).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -381,6 +446,25 @@ mod tests {
         assert_eq!(plans.free.max_total_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(plans.free.retention_seconds, 24 * 60 * 60);
         assert!(plans.free.available);
+    }
+
+    #[test]
+    fn multipart_threshold_preserves_small_single_put_path() {
+        assert!(!should_use_multipart(MULTIPART_UPLOAD_THRESHOLD_BYTES));
+        assert!(should_use_multipart(MULTIPART_UPLOAD_THRESHOLD_BYTES + 1));
+    }
+
+    #[test]
+    fn multipart_part_shape_respects_r2_limits() {
+        let size = 10 * 1024 * 1024 * 1024_u64;
+        let part_size = multipart_part_size(size).expect("part size");
+        let part_count = multipart_part_count(size).expect("part count");
+
+        assert!(part_size >= 5 * 1024 * 1024);
+        assert!(part_size <= 5 * 1024 * 1024 * 1024);
+        assert!(part_count <= MAX_MULTIPART_PARTS);
+        assert_eq!(part_size, MULTIPART_UPLOAD_PART_BYTES);
+        assert_eq!(part_count, 160);
     }
 }
 
@@ -589,14 +673,15 @@ async fn create_cloud_share_inner(
             name: name.clone(),
             path: path.clone(),
             size: file.size,
-            content_type,
+            content_type: content_type.clone(),
             last_modified: file.last_modified,
             object_key: object_key.clone(),
         });
 
-        let upload_url = presign_put(
+        let upload = presign_upload_target(
             storage,
             &object_key,
+            &content_type,
             file.size,
             state.config.cloud.upload_url_ttl_seconds,
         )
@@ -606,7 +691,8 @@ async fn create_cloud_share_inner(
             name,
             path,
             size: file.size,
-            upload_url,
+            upload_url: upload.upload_url,
+            multipart: upload.multipart,
         });
     }
 
@@ -684,6 +770,10 @@ async fn complete_cloud_share_inner(
         ));
     }
 
+    for multipart_upload in request.multipart_uploads {
+        complete_cloud_file_multipart_upload(storage, &manifest, multipart_upload).await?;
+    }
+
     for file in &manifest.files {
         ensure_object_exists(storage, &file.object_key, file.size).await?;
     }
@@ -697,6 +787,122 @@ async fn complete_cloud_share_inner(
     }
     write_manifest(storage, &manifest).await?;
     Ok(public_share(manifest, None, false))
+}
+
+async fn complete_cloud_file_multipart_upload(
+    storage: &CloudStorage,
+    manifest: &CloudShareManifest,
+    request: CompleteMultipartUploadRequest,
+) -> Result<(), CloudShareError> {
+    if manifest.completed {
+        return Err(CloudShareError::conflict(
+            "Share upload is already complete",
+        ));
+    }
+    let file = manifest
+        .files
+        .iter()
+        .find(|file| file.id == request.file_id)
+        .ok_or_else(|| CloudShareError::not_found("File not found"))?;
+    if !should_use_multipart(file.size) {
+        return Err(CloudShareError::bad_request(
+            "Multipart completion is only valid for multipart upload targets",
+        ));
+    }
+    if request.upload_id.trim().is_empty() {
+        return Err(CloudShareError::bad_request(
+            "Multipart upload ID is required",
+        ));
+    }
+    let expected_parts = multipart_part_count(file.size)?;
+    if request.parts.len() as u64 != expected_parts {
+        return Err(CloudShareError::bad_request(
+            "Uploaded part list does not match the created multipart upload",
+        ));
+    }
+
+    let mut parts = request
+        .parts
+        .into_iter()
+        .map(|part| {
+            let e_tag = part.e_tag.trim().to_string();
+            if part.part_number < 1 || e_tag.is_empty() {
+                return Err(CloudShareError::bad_request(
+                    "Multipart completion requires valid part numbers and ETags",
+                ));
+            }
+            Ok(CompletedPart::builder()
+                .part_number(part.part_number)
+                .e_tag(e_tag)
+                .build())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    parts.sort_by_key(|part| part.part_number().unwrap_or_default());
+
+    for (index, part) in parts.iter().enumerate() {
+        if part.part_number() != Some((index + 1) as i32) {
+            return Err(CloudShareError::bad_request(
+                "Multipart parts must be consecutive and start at 1",
+            ));
+        }
+    }
+
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(parts))
+        .build();
+    let upload_id = request.upload_id.trim();
+    if let Err(error) = storage
+        .client
+        .complete_multipart_upload()
+        .bucket(&storage.bucket)
+        .key(&file.object_key)
+        .upload_id(upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await
+    {
+        let _ = abort_multipart_upload(storage, &file.object_key, upload_id).await;
+        return Err(CloudShareError::internal(error));
+    }
+
+    ensure_object_exists(storage, &file.object_key, file.size).await?;
+    Ok(())
+}
+
+async fn abort_cloud_share_uploads_inner(
+    state: Arc<AppState>,
+    share_id: &str,
+    request: AbortCloudShareUploadsRequest,
+) -> Result<(), CloudShareError> {
+    let storage = state.cloud_storage()?;
+    let manifest = read_share_manifest(&state, storage, share_id).await?;
+
+    for multipart_upload in request.multipart_uploads {
+        let Some(file) = manifest
+            .files
+            .iter()
+            .find(|file| file.id == multipart_upload.file_id)
+        else {
+            continue;
+        };
+        if !should_use_multipart(file.size) || multipart_upload.upload_id.trim().is_empty() {
+            continue;
+        }
+
+        if let Err(error) =
+            abort_multipart_upload(storage, &file.object_key, multipart_upload.upload_id.trim())
+                .await
+        {
+            tracing::warn!(
+                share_id = %manifest.share_id,
+                file_id = %file.id,
+                error = ?error,
+                "failed to abort incomplete multipart upload"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn read_public_share(
@@ -981,10 +1187,36 @@ fn validate_create_request(
     Ok(())
 }
 
+struct PresignedUploadTarget {
+    upload_url: Option<String>,
+    multipart: Option<CloudMultipartUploadTarget>,
+}
+
+async fn presign_upload_target(
+    storage: &CloudStorage,
+    object_key: &str,
+    content_type: &str,
+    size: u64,
+    ttl_seconds: u64,
+) -> Result<PresignedUploadTarget, CloudShareError> {
+    if should_use_multipart(size) {
+        let multipart =
+            presign_multipart_upload(storage, object_key, content_type, size, ttl_seconds).await?;
+        return Ok(PresignedUploadTarget {
+            upload_url: None,
+            multipart: Some(multipart),
+        });
+    }
+
+    Ok(PresignedUploadTarget {
+        upload_url: Some(presign_put(storage, object_key, ttl_seconds).await?),
+        multipart: None,
+    })
+}
+
 async fn presign_put(
     storage: &CloudStorage,
     object_key: &str,
-    expected_size: u64,
     ttl_seconds: u64,
 ) -> Result<String, CloudShareError> {
     let presigned = storage
@@ -992,12 +1224,109 @@ async fn presign_put(
         .put_object()
         .bucket(&storage.bucket)
         .key(object_key)
-        .content_length(i64::try_from(expected_size).unwrap_or(i64::MAX))
         .presigned(presign_config(ttl_seconds)?)
         .await
         .map_err(CloudShareError::internal)?;
 
     Ok(presigned.uri().to_string())
+}
+
+async fn presign_multipart_upload(
+    storage: &CloudStorage,
+    object_key: &str,
+    content_type: &str,
+    size: u64,
+    ttl_seconds: u64,
+) -> Result<CloudMultipartUploadTarget, CloudShareError> {
+    let upload = storage
+        .client
+        .create_multipart_upload()
+        .bucket(&storage.bucket)
+        .key(object_key)
+        .content_type(content_type)
+        .send()
+        .await
+        .map_err(CloudShareError::internal)?;
+    let upload_id = upload
+        .upload_id()
+        .ok_or_else(|| CloudShareError::internal("R2 did not return a multipart upload ID"))?;
+    let part_size = multipart_part_size(size)?;
+    let mut parts = Vec::with_capacity(multipart_part_count(size)? as usize);
+    let part_count = multipart_part_count(size)?;
+
+    for index in 0..part_count {
+        let offset = index * part_size;
+        let part_number = i32::try_from(index + 1).map_err(CloudShareError::internal)?;
+        let part_size = if index + 1 == part_count {
+            size.saturating_sub(offset)
+        } else {
+            part_size
+        };
+        let presigned = storage
+            .client
+            .upload_part()
+            .bucket(&storage.bucket)
+            .key(object_key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .presigned(presign_config(ttl_seconds)?)
+            .await
+            .map_err(CloudShareError::internal)?;
+        parts.push(CloudMultipartUploadPart {
+            part_number,
+            offset,
+            size: part_size,
+            upload_url: presigned.uri().to_string(),
+        });
+    }
+
+    Ok(CloudMultipartUploadTarget {
+        upload_id: upload_id.to_string(),
+        part_size,
+        parts,
+    })
+}
+
+async fn abort_multipart_upload(
+    storage: &CloudStorage,
+    object_key: &str,
+    upload_id: &str,
+) -> Result<(), CloudShareError> {
+    storage
+        .client
+        .abort_multipart_upload()
+        .bucket(&storage.bucket)
+        .key(object_key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .map_err(CloudShareError::internal)?;
+    Ok(())
+}
+
+fn should_use_multipart(size: u64) -> bool {
+    size > MULTIPART_UPLOAD_THRESHOLD_BYTES
+}
+
+fn multipart_part_size(size: u64) -> Result<u64, CloudShareError> {
+    if size == 0 {
+        return Err(CloudShareError::bad_request(
+            "Empty files are not supported",
+        ));
+    }
+    let minimum_part_size = size.div_ceil(MAX_MULTIPART_PARTS).max(5 * 1024 * 1024);
+    Ok(MULTIPART_UPLOAD_PART_BYTES.max(minimum_part_size))
+}
+
+fn multipart_part_count(size: u64) -> Result<u64, CloudShareError> {
+    let part_size = multipart_part_size(size)?;
+    let part_count = size.div_ceil(part_size);
+    if part_count == 0 || part_count > MAX_MULTIPART_PARTS {
+        return Err(CloudShareError::bad_request(
+            "File is too large for multipart Cloud Drop upload",
+        ));
+    }
+    Ok(part_count)
 }
 
 async fn ensure_object_exists(

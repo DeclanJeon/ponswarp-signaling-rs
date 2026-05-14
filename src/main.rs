@@ -107,6 +107,10 @@ async fn main() -> Result<()> {
             post(handlers::complete_cloud_share),
         )
         .route(
+            "/api/cloud-share/:share_id/abort",
+            post(handlers::abort_cloud_share_uploads),
+        )
+        .route(
             "/api/cloud-share/:share_id/files/:file_id/download",
             get(handlers::download_cloud_file),
         )
