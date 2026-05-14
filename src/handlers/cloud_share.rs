@@ -273,13 +273,13 @@ fn cloud_plans_response(
     let checkout_enabled = payment_providers.iter().any(|provider| provider.available);
     CloudPlansResponse {
         direct_p2p: DirectP2pPlan {
-            label: "Direct P2P".to_string(),
+            label: "Free Direct Send".to_string(),
             unlimited: true,
             price_krw: 0,
         },
         free: CloudPlanLimit {
             sku: "free_cloud_10gb_24h".to_string(),
-            label: "Free Cloud Drop".to_string(),
+            label: "PonsWarp Free".to_string(),
             price_krw: 0,
             max_total_bytes: config.max_total_bytes,
             max_file_bytes: config.max_file_bytes,
@@ -341,6 +341,46 @@ fn cloud_plans_response(
         },
         checkout_enabled,
         payment_providers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cloud_config() -> CloudConfig {
+        const GB: u64 = 1024 * 1024 * 1024;
+        CloudConfig {
+            enabled: true,
+            billing_enabled: true,
+            bucket: "ponslink".to_string(),
+            endpoint: "https://example.r2.cloudflarestorage.com".to_string(),
+            access_key_id: "key".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            prefix: "ponswarp-cloud".to_string(),
+            retention_seconds: 24 * 60 * 60,
+            upload_url_ttl_seconds: 3600,
+            download_url_ttl_seconds: 300,
+            cleanup_interval_seconds: 300,
+            cleanup_run_on_startup: true,
+            max_files: 100,
+            max_file_bytes: 10 * GB,
+            max_total_bytes: 10 * GB,
+        }
+    }
+
+    #[test]
+    fn free_plan_exposes_zero_price_and_policy_limits() {
+        let plans = cloud_plans_response(&cloud_config(), Vec::new());
+
+        assert_eq!(plans.direct_p2p.price_krw, 0);
+        assert!(plans.direct_p2p.unlimited);
+        assert_eq!(plans.free.label, "PonsWarp Free");
+        assert_eq!(plans.free.price_krw, 0);
+        assert_eq!(plans.free.max_total_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(plans.free.retention_seconds, 24 * 60 * 60);
+        assert!(plans.free.available);
     }
 }
 
@@ -509,7 +549,7 @@ async fn enforce_paid_usage_limits(
 fn free_plan_snapshot(config: &CloudConfig, retention_seconds: u64) -> serde_json::Value {
     json!({
         "sku": "free_cloud_10gb_24h",
-        "label": "Free Cloud Drop",
+        "label": "PonsWarp Free",
         "priceKrw": 0,
         "maxTotalBytes": config.max_total_bytes,
         "maxFileBytes": config.max_file_bytes,
