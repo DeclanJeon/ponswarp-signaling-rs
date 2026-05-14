@@ -1,6 +1,7 @@
 //! 환경 변수 기반 설정 관리
 
 use std::env;
+use std::path::Path;
 
 /// 서버 설정
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct AdminConfig {
 pub struct AuthConfig {
     pub google_client_id: String,
     pub google_client_secret: String,
+    pub google_redirect_uri: String,
     pub session_secret: String,
     pub session_cookie_name: String,
     pub session_ttl_seconds: u64,
@@ -119,7 +121,7 @@ pub struct CloudConfig {
 impl Config {
     /// 환경 변수에서 설정 로드
     pub fn from_env() -> Self {
-        dotenvy::dotenv().ok();
+        load_env_files();
 
         let r2_account_id = env::var("R2_ACCOUNT_ID").unwrap_or_default();
         let r2_endpoint = env::var("R2_ENDPOINT")
@@ -173,8 +175,12 @@ impl Config {
                     .unwrap_or(true),
             },
             auth: AuthConfig {
-                google_client_id: env::var("GOOGLE_OAUTH_CLIENT_ID").unwrap_or_default(),
-                google_client_secret: env::var("GOOGLE_OAUTH_CLIENT_SECRET").unwrap_or_default(),
+                google_client_id: env::var("GOOGLE_CLIENT_ID")
+                    .or_else(|_| env::var("GOOGLE_OAUTH_CLIENT_ID"))
+                    .unwrap_or_default(),
+                google_client_secret: env::var("GOOGLE_CLIENT_SECRET")
+                    .or_else(|_| env::var("GOOGLE_OAUTH_CLIENT_SECRET"))
+                    .unwrap_or_default(),
                 session_secret: env::var("AUTH_SESSION_SECRET").unwrap_or_default(),
                 session_cookie_name: env::var("AUTH_SESSION_COOKIE_NAME")
                     .unwrap_or_else(|_| "ponswarp_session".to_string()),
@@ -185,6 +191,15 @@ impl Config {
                 public_api_url: env::var("PONSWARP_PUBLIC_API_URL")
                     .or_else(|_| env::var("PONSWARP_PUBLIC_APP_URL"))
                     .unwrap_or_else(|_| "https://warp.ponslink.com".to_string()),
+                google_redirect_uri: env::var("GOOGLE_REDIRECT_URI").unwrap_or_else(|_| {
+                    let public_api_url = env::var("PONSWARP_PUBLIC_API_URL")
+                        .or_else(|_| env::var("PONSWARP_PUBLIC_APP_URL"))
+                        .unwrap_or_else(|_| "https://warp.ponslink.com".to_string());
+                    format!(
+                        "{}/auth/google/callback",
+                        public_api_url.trim_end_matches('/')
+                    )
+                }),
             },
             admin: AdminConfig {
                 bootstrap_emails: env::var("ADMIN_BOOTSTRAP_EMAILS")
@@ -331,5 +346,31 @@ impl Config {
             },
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
         }
+    }
+}
+
+fn load_env_files() {
+    dotenvy::from_filename(".env").ok();
+
+    if let Ok(env_file) = env::var("PONSWARP_ENV_FILE") {
+        dotenvy::from_filename_override(env_file).ok();
+        return;
+    }
+
+    let app_env = env::var("PONSWARP_ENV")
+        .or_else(|_| env::var("APP_ENV"))
+        .unwrap_or_else(|_| "local".to_string());
+
+    load_env_file_if_exists(&format!(".env.{app_env}"));
+    load_env_file_if_exists(&format!(".env.{app_env}.local"));
+
+    if app_env == "local" || app_env == "development" {
+        load_env_file_if_exists(".env.local");
+    }
+}
+
+fn load_env_file_if_exists(path: &str) {
+    if Path::new(path).exists() {
+        dotenvy::from_filename_override(path).ok();
     }
 }

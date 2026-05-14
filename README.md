@@ -22,11 +22,24 @@ cargo build --release
 
 ## 환경 변수
 
-`.env.example`을 `.env`로 복사 후 설정:
+환경별 템플릿을 복사해서 사용합니다. 실제 키와 secret은 Git에 커밋하지 마세요.
 
 ```bash
-cp .env.example .env
+# 로컬 개발
+cp .env.local.example .env.local
+cargo run
+
+# 운영 설정 파일로 실행
+cp .env.production.example .env.production
+PONSWARP_ENV=production cargo run --release
+
+# 또는 명시 파일 지정
+PONSWARP_ENV_FILE=/secure/path/ponswarp-signaling.env ./target/release/ponswarp-signaling-rs
 ```
+
+서버는 먼저 `.env`를 읽고, `PONSWARP_ENV`에 따라 `.env.local`, `.env.production`, `.env.<env>.local`을 추가로 읽습니다. `PONSWARP_ENV_FILE`이 있으면 `.env` 이후 해당 파일을 가장 마지막에 읽어 값을 덮어씁니다.
+
+운영 배포는 저장소 루트의 `deploy/deploy-production.sh`를 사용합니다. 이 스크립트는 백엔드 env-file을 항상 `ponswarp-signaling-rs/.env.production`에서 업로드하고 Docker 실행 시 `PONSWARP_ENV=production`을 명시합니다. 운영 배포용 값은 `.env`나 `.env.local`이 아니라 `.env.production`에 넣어야 합니다.
 
 ## API
 
@@ -87,8 +100,8 @@ PONSWARP_BILLING_ENABLED=false
 PONSWARP_PUBLIC_APP_URL=https://warp.ponslink.com
 PONSWARP_PUBLIC_API_URL=https://warp.ponslink.com
 PONSWARP_DEFAULT_PAYMENT_PROVIDER=lemonsqueezy
-GOOGLE_OAUTH_CLIENT_ID=...
-GOOGLE_OAUTH_CLIENT_SECRET=...
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
 AUTH_SESSION_SECRET=...
 AUTH_SESSION_COOKIE_NAME=ponswarp_session
 AUTH_SESSION_TTL_SECONDS=2592000

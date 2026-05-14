@@ -384,10 +384,7 @@ fn random_token(bytes: usize) -> String {
 }
 
 fn google_redirect_uri(state: &AppState) -> String {
-    format!(
-        "{}/auth/google/callback",
-        state.config.auth.public_api_url.trim_end_matches('/')
-    )
+    state.config.auth.google_redirect_uri.clone()
 }
 
 fn safe_return_path(value: Option<&str>) -> String {
