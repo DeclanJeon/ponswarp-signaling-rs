@@ -160,7 +160,8 @@ pub async fn google_callback(
 
     match finish_google_sign_in(&state, database, code).await {
         Ok(session_token) => {
-            let mut response = Redirect::to(&return_path).into_response();
+            let target = app_return_url(&state.config.auth.public_app_url, &return_path);
+            let mut response = Redirect::to(&target).into_response();
             match HeaderValue::from_str(&session_cookie(&state, &session_token)) {
                 Ok(cookie) => {
                     response.headers_mut().append(SET_COOKIE, cookie);
@@ -255,7 +256,8 @@ async fn exchange_google_code(
     state: &AppState,
     code: &str,
 ) -> Result<GoogleTokenResponse, AuthError> {
-    state
+    let redirect_uri = google_redirect_uri(state);
+    let response = state
         .http
         .post("https://oauth2.googleapis.com/token")
         .form(&[
@@ -265,17 +267,30 @@ async fn exchange_google_code(
                 "client_secret",
                 state.config.auth.google_client_secret.as_str(),
             ),
-            ("redirect_uri", google_redirect_uri(state).as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
             ("grant_type", "authorization_code"),
         ])
         .send()
         .await
-        .map_err(AuthError::internal)?
-        .error_for_status()
-        .map_err(AuthError::internal)?
-        .json()
-        .await
-        .map_err(AuthError::internal)
+        .map_err(AuthError::internal)?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("failed to read Google error body: {error}"));
+        tracing::error!(
+            status = %status,
+            error_body = %body,
+            "Google token exchange failed"
+        );
+        return Err(AuthError::internal(format!(
+            "Google token exchange failed with {status}: {body}"
+        )));
+    }
+
+    response.json().await.map_err(AuthError::internal)
 }
 
 async fn verify_google_id_token(
@@ -399,10 +414,19 @@ fn safe_return_path(value: Option<&str>) -> String {
 }
 
 fn redirect_with_error(state: &AppState, return_path: &str, code: &str) -> Response {
-    let separator = if return_path.contains('?') { "&" } else { "?" };
-    let target = format!("{return_path}{separator}auth={code}");
-    let _ = state;
+    let target = app_return_url(&state.config.auth.public_app_url, return_path);
+    let separator = if target.contains('?') { "&" } else { "?" };
+    let target = format!("{target}{separator}auth={code}");
     Redirect::to(&target).into_response()
+}
+
+fn app_return_url(public_app_url: &str, return_path: &str) -> String {
+    let base = public_app_url.trim_end_matches('/');
+    if return_path.starts_with('/') {
+        format!("{base}{return_path}")
+    } else {
+        format!("{base}/{return_path}")
+    }
 }
 
 fn is_email_verified(value: &Value) -> bool {
@@ -470,5 +494,34 @@ impl IntoResponse for AuthError {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{app_return_url, safe_return_path};
+
+    #[test]
+    fn safe_return_path_accepts_only_relative_app_paths() {
+        assert_eq!(safe_return_path(Some("/pricing")), "/pricing");
+        assert_eq!(
+            safe_return_path(Some("/pricing?plan=pro")),
+            "/pricing?plan=pro"
+        );
+        assert_eq!(safe_return_path(Some("https://evil.example")), "/pricing");
+        assert_eq!(safe_return_path(Some("//evil.example")), "/pricing");
+        assert_eq!(safe_return_path(None), "/pricing");
+    }
+
+    #[test]
+    fn app_return_url_targets_frontend_origin() {
+        assert_eq!(
+            app_return_url("http://localhost:3500", "/pricing?plan=pro"),
+            "http://localhost:3500/pricing?plan=pro"
+        );
+        assert_eq!(
+            app_return_url("https://warp.ponslink.com/", "pricing"),
+            "https://warp.ponslink.com/pricing"
+        );
     }
 }

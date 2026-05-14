@@ -35,6 +35,7 @@ pub struct AuthConfig {
     pub session_secret: String,
     pub session_cookie_name: String,
     pub session_ttl_seconds: u64,
+    pub public_app_url: String,
     pub public_api_url: String,
 }
 
@@ -188,6 +189,9 @@ impl Config {
                     .unwrap_or_else(|_| "2592000".to_string())
                     .parse()
                     .unwrap_or(30 * 24 * 60 * 60),
+                public_app_url: env::var("PONSWARP_PUBLIC_APP_URL")
+                    .or_else(|_| env::var("PONSWARP_PUBLIC_API_URL"))
+                    .unwrap_or_else(|_| "https://warp.ponslink.com".to_string()),
                 public_api_url: env::var("PONSWARP_PUBLIC_API_URL")
                     .or_else(|_| env::var("PONSWARP_PUBLIC_APP_URL"))
                     .unwrap_or_else(|_| "https://warp.ponslink.com".to_string()),
