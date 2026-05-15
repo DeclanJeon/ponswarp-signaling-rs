@@ -94,18 +94,6 @@ fn build_ice_servers(config: &TurnConfig, username: &str, password: &str) -> Vec
         ));
     }
 
-    // 폴백 서버 추가
-    for fallback in &config.fallback_servers {
-        if config.enable_tls {
-            turn_urls.push(format!(
-                "turns:{}:{}?transport=tcp",
-                fallback, config.ports.tls
-            ));
-        } else {
-            turn_urls.push(format!("turn:{}:{}", fallback, config.ports.udp));
-        }
-    }
-
     // TURN 서버 (인증 필요)
     for url in &turn_urls {
         servers.push(IceServer {
@@ -114,6 +102,43 @@ fn build_ice_servers(config: &TurnConfig, username: &str, password: &str) -> Vec
             credential: Some(password.to_string()),
             credential_type: Some("password".to_string()),
         });
+    }
+
+    // 폴백 서버 추가. 값이 이미 stun:/turn:/turns: URL이면 그대로 사용한다.
+    // production에는 `stun:stun.l.google.com:19302`가 들어오므로 host:port로 재조합하면
+    // `turn:stun:stun.l.google.com:19302:3478` 같은 브라우저가 거부하는 URL이 된다.
+    for fallback in &config.fallback_servers {
+        let fallback = fallback.trim();
+        if fallback.is_empty() {
+            continue;
+        }
+        if fallback.starts_with("stun:") {
+            servers.push(IceServer {
+                urls: vec![fallback.to_string()],
+                username: None,
+                credential: None,
+                credential_type: None,
+            });
+        } else if fallback.starts_with("turn:") || fallback.starts_with("turns:") {
+            servers.push(IceServer {
+                urls: vec![fallback.to_string()],
+                username: Some(username.to_string()),
+                credential: Some(password.to_string()),
+                credential_type: Some("password".to_string()),
+            });
+        } else {
+            let fallback_url = if config.enable_tls {
+                format!("turns:{}:{}?transport=tcp", fallback, config.ports.tls)
+            } else {
+                format!("turn:{}:{}", fallback, config.ports.udp)
+            };
+            servers.push(IceServer {
+                urls: vec![fallback_url],
+                username: Some(username.to_string()),
+                credential: Some(password.to_string()),
+                credential_type: Some("password".to_string()),
+            });
+        }
     }
 
     // STUN 서버 (인증 불필요)
@@ -141,4 +166,51 @@ pub fn validate_credentials(username: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TurnConfig, TurnPorts};
+
+    fn turn_config_with_fallbacks(fallback_servers: Vec<String>) -> TurnConfig {
+        TurnConfig {
+            url: "ponslink.com".to_string(),
+            secret: "test-secret".to_string(),
+            realm: "ponslink.com".to_string(),
+            enable_tls: false,
+            enable_udp: true,
+            enable_tcp: true,
+            ports: TurnPorts {
+                udp: 3478,
+                tcp: 3478,
+                tls: 443,
+            },
+            credential_ttl: 600,
+            fallback_servers,
+        }
+    }
+
+    #[test]
+    fn fallback_stun_url_is_returned_as_stun_server_without_turn_credentials() {
+        let config = turn_config_with_fallbacks(vec!["stun:stun.l.google.com:19302".to_string()]);
+
+        let servers = build_ice_servers(&config, "user:123", "password");
+
+        assert!(
+            servers.iter().any(|server| {
+                server.urls == vec!["stun:stun.l.google.com:19302".to_string()]
+                    && server.username.is_none()
+                    && server.credential.is_none()
+            }),
+            "expected raw STUN fallback URL without credentials, got {servers:?}"
+        );
+        assert!(
+            servers
+                .iter()
+                .flat_map(|server| server.urls.iter())
+                .all(|url| !url.starts_with("turn:stun:")),
+            "fallback STUN URL must not be rewritten into invalid TURN URL: {servers:?}"
+        );
+    }
 }
