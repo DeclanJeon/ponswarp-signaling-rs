@@ -80,18 +80,22 @@ fn generate_hmac_hash(username: &str, secret: &str) -> String {
 fn build_ice_servers(config: &TurnConfig, username: &str, password: &str) -> Vec<IceServer> {
     let mut servers = Vec::new();
     let mut turn_urls = Vec::new();
+    let turn_host = normalize_turn_host(&config.url);
 
     if config.enable_udp {
-        turn_urls.push(format!("turn:{}:{}", config.url, config.ports.udp));
+        turn_urls.push(format!("turn:{}:{}", turn_host, config.ports.udp));
     }
     if config.enable_tcp {
-        turn_urls.push(format!("turn:{}:{}", config.url, config.ports.tcp));
+        let tcp_url = format!("turn:{}:{}", turn_host, config.ports.tcp);
+        if !turn_urls.contains(&tcp_url) {
+            turn_urls.push(tcp_url);
+        }
     }
     if config.enable_tls {
-        turn_urls.push(format!(
-            "turns:{}:{}?transport=tcp",
-            config.url, config.ports.tls
-        ));
+        let tls_url = format!("turns:{}:{}?transport=tcp", turn_host, config.ports.tls);
+        if !turn_urls.contains(&tls_url) {
+            turn_urls.push(tls_url);
+        }
     }
 
     // TURN 서버 (인증 필요)
@@ -144,7 +148,7 @@ fn build_ice_servers(config: &TurnConfig, username: &str, password: &str) -> Vec
     // STUN 서버 (인증 불필요)
     if config.enable_udp {
         servers.push(IceServer {
-            urls: vec![format!("stun:{}:{}", config.url, config.ports.udp)],
+            urls: vec![format!("stun:{}:{}", turn_host, config.ports.udp)],
             username: None,
             credential: None,
             credential_type: None,
@@ -152,6 +156,34 @@ fn build_ice_servers(config: &TurnConfig, username: &str, password: &str) -> Vec
     }
 
     servers
+}
+
+fn normalize_turn_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_scheme = trimmed
+        .strip_prefix("turns:")
+        .or_else(|| trimmed.strip_prefix("turn:"))
+        .or_else(|| trimmed.strip_prefix("stun:"))
+        .unwrap_or(trimmed);
+    let without_query = without_scheme.split('?').next().unwrap_or(without_scheme);
+    let without_slashes = without_query.trim_start_matches("//");
+    let mut host = without_slashes;
+
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            return host[..=end].to_string();
+        }
+    }
+
+    if host.matches(':').count() == 1 {
+        if let Some((candidate_host, candidate_port)) = host.rsplit_once(':') {
+            if candidate_port.parse::<u16>().is_ok() {
+                host = candidate_host;
+            }
+        }
+    }
+
+    host.to_string()
 }
 
 /// 자격증명 유효성 검증
@@ -211,6 +243,25 @@ mod tests {
                 .flat_map(|server| server.urls.iter())
                 .all(|url| !url.starts_with("turn:stun:")),
             "fallback STUN URL must not be rewritten into invalid TURN URL: {servers:?}"
+        );
+    }
+
+    #[test]
+    fn turn_server_url_with_scheme_and_port_is_normalized_before_composing_ice_urls() {
+        let mut config = turn_config_with_fallbacks(vec!["stun:stun.l.google.com:19302".to_string()]);
+        config.url = "turn:localhost:3478".to_string();
+
+        let servers = build_ice_servers(&config, "user:123", "password");
+        let urls: Vec<String> = servers
+            .iter()
+            .flat_map(|server| server.urls.iter().cloned())
+            .collect();
+
+        assert!(urls.contains(&"turn:localhost:3478".to_string()));
+        assert!(urls.contains(&"stun:localhost:3478".to_string()));
+        assert!(
+            urls.iter().all(|url| !url.contains("turn:turn:") && !url.ends_with(":3478:3478")),
+            "ICE URLs must be browser-parseable, got {urls:?}"
         );
     }
 }

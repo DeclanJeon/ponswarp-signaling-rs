@@ -113,43 +113,48 @@ pub async fn handle_join_room(state: Arc<AppState>, peer_id: &str, room_id: &str
 
 /// 방 나가기 내부 로직
 pub async fn leave_room_internal(state: &AppState, peer_id: &str, room_id: &str) {
-    let should_delete = if let Some(room) = state.rooms.get(room_id) {
+    // DashMap room guard를 잡은 상태에서 await/broadcast_to_room을 호출하면
+    // broadcast_to_room이 같은 DashMap shard를 다시 조회하면서 런타임 전체가
+    // 멈출 수 있다. 먼저 필요한 상태만 복사하고 guard를 명시적으로 drop한 뒤
+    // 네트워크/채널 작업을 수행한다.
+    let Some((remaining, updated_users, should_delete)) = (if let Some(room) = state.rooms.get(room_id) {
         room.users.write().await.remove(peer_id);
-        let remaining = room.users.read().await.len();
+        let updated_users: Vec<String> = room.users.read().await.iter().cloned().collect();
+        let remaining = updated_users.len();
+        Some((remaining, updated_users, remaining == 0))
+    } else {
+        None
+    }) else {
+        return;
+    };
 
-        // 다른 사용자들에게 알림
+    // 다른 사용자들에게 알림 (room guard 해제 후)
+    broadcast_to_room(
+        state,
+        room_id,
+        ServerMessage::UserLeft {
+            socket_id: peer_id.to_string(),
+        },
+    )
+    .await;
+
+    if remaining > 0 {
         broadcast_to_room(
             state,
             room_id,
-            ServerMessage::UserLeft {
-                socket_id: peer_id.to_string(),
+            ServerMessage::RoomUsers {
+                users: updated_users,
             },
         )
         .await;
+    }
 
-        if remaining > 0 {
-            let updated_users: Vec<String> = room.users.read().await.iter().cloned().collect();
-            broadcast_to_room(
-                state,
-                room_id,
-                ServerMessage::RoomUsers {
-                    users: updated_users,
-                },
-            )
-            .await;
-        }
-
-        tracing::info!(
-            peer_id = %peer_id,
-            room_id = %room_id,
-            remaining = remaining,
-            "User left room"
-        );
-
-        remaining == 0
-    } else {
-        false
-    };
+    tracing::info!(
+        peer_id = %peer_id,
+        room_id = %room_id,
+        remaining = remaining,
+        "User left room"
+    );
 
     if should_delete {
         state.rooms.remove(room_id);
