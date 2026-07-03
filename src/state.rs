@@ -3,6 +3,7 @@
 use crate::billing::BillingClient;
 use crate::config::Config;
 use crate::database::CloudDatabase;
+use crate::mesh::MeshState;
 use crate::protocol::ServerMessage;
 use anyhow::{bail, Result};
 use aws_config::BehaviorVersion;
@@ -30,6 +31,8 @@ pub struct AppState {
     pub billing: Option<Arc<BillingClient>>,
     /// Shared outbound HTTP client for OAuth and provider APIs
     pub http: reqwest::Client,
+    /// In-memory Mesh MVP registry guarded by PONSWARP_MESH_ENABLED.
+    pub mesh: Arc<MeshState>,
 }
 
 impl AppState {
@@ -45,6 +48,7 @@ impl AppState {
             cloud_db,
             billing,
             http: reqwest::Client::new(),
+            mesh: Arc::new(MeshState::default()),
         })
     }
 
@@ -56,6 +60,24 @@ impl AppState {
                 "Cloud share is not configured",
             )
         })
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    pub fn new_for_test_with_mesh(mesh_enabled: bool) -> Self {
+        let mut config = Config::from_env();
+        config.mesh.enabled = mesh_enabled;
+        Self {
+            rooms: DashMap::new(),
+            peers: DashMap::new(),
+            config: Arc::new(config),
+            cloud: None,
+            cloud_db: None,
+            billing: None,
+            http: reqwest::Client::new(),
+            mesh: Arc::new(MeshState::default()),
+        }
     }
 }
 

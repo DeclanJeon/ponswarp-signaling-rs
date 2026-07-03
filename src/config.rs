@@ -17,6 +17,7 @@ pub struct Config {
     pub room: RoomConfig,
     pub turn: TurnConfig,
     pub cloud: CloudConfig,
+    pub mesh: MeshConfig,
     pub log_level: String,
 }
 
@@ -119,6 +120,24 @@ pub struct CloudConfig {
     pub max_total_bytes: u64,
 }
 
+/// PonsWarp AI Mesh / Workspace Coordinator settings.
+#[derive(Debug, Clone)]
+pub struct MeshConfig {
+    pub enabled: bool,
+    pub auto_approve_nodes: bool,
+    pub presence_ttl_seconds: u64,
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_approve_nodes: false,
+            presence_ttl_seconds: 60,
+        }
+    }
+}
+
 impl Config {
     /// 환경 변수에서 설정 로드
     pub fn from_env() -> Self {
@@ -174,6 +193,18 @@ impl Config {
                 run_migrations: env::var("DATABASE_RUN_MIGRATIONS")
                     .map(|v| v != "false")
                     .unwrap_or(true),
+            },
+            mesh: MeshConfig {
+                enabled: env::var("PONSWARP_MESH_ENABLED")
+                    .map(|v| v == "true")
+                    .unwrap_or(false),
+                auto_approve_nodes: env::var("PONSWARP_MESH_AUTO_APPROVE_NODES")
+                    .map(|v| v == "true")
+                    .unwrap_or(false),
+                presence_ttl_seconds: env::var("PONSWARP_MESH_PRESENCE_TTL_SECONDS")
+                    .unwrap_or_else(|_| "60".to_string())
+                    .parse()
+                    .unwrap_or(60),
             },
             auth: AuthConfig {
                 google_client_id: env::var("GOOGLE_CLIENT_ID")
@@ -350,6 +381,15 @@ impl Config {
             },
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+impl Config {
+    pub fn from_env_with_mesh(mesh: MeshConfig) -> Self {
+        let mut config = Self::from_env();
+        config.mesh = mesh;
+        config
     }
 }
 

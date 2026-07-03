@@ -6,6 +6,7 @@ mod billing;
 mod config;
 mod database;
 mod handlers;
+mod mesh;
 mod protocol;
 mod state;
 
@@ -20,7 +21,7 @@ use axum::{
         HeaderValue, Method, StatusCode,
     },
     response::{Html, IntoResponse, Json},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use config::Config;
@@ -80,6 +81,53 @@ async fn main() -> Result<()> {
         .route("/health", get(health_handler))
         .route("/ready", get(readiness_handler))
         .route("/ws", get(ws_handler))
+        .route("/api/mesh/health", get(mesh::mesh_health))
+        .route("/api/mesh/ready", get(mesh::mesh_ready))
+        .route("/api/mesh/workspaces", post(mesh::create_workspace))
+        .route(
+            "/api/mesh/workspaces/:workspace_id/nodes",
+            post(mesh::register_node),
+        )
+        .route(
+            "/api/mesh/workspaces/:workspace_id/nodes/:node_id/heartbeat",
+            post(mesh::heartbeat),
+        )
+        .route(
+            "/api/mesh/workspaces/:workspace_id/files",
+            get(mesh::list_files).post(mesh::publish_file),
+        )
+        .route(
+            "/api/mesh/workspaces/:workspace_id/files/:file_id",
+            get(mesh::get_file),
+        )
+        .route(
+            "/api/mesh/workspaces/:workspace_id/files/:file_id/availability/:node_id",
+            put(mesh::update_availability),
+        )
+        .route(
+            "/api/mesh/workspaces/:workspace_id/files/:file_id/candidates",
+            get(mesh::candidates),
+        )
+        .route(
+            "/api/mesh/workspaces/:workspace_id/events",
+            post(mesh::record_event),
+        )
+        .route(
+            "/api/mesh/workspaces/:workspace_id/shares",
+            post(mesh::create_share),
+        )
+        .route(
+            "/api/mesh/shares/:code",
+            get(mesh::resolve_share).delete(mesh::revoke_share),
+        )
+        .route(
+            "/api/mesh/shares/:code/candidates",
+            get(mesh::share_candidates),
+        )
+        .route(
+            "/api/mesh/shares/:code/events",
+            post(mesh::record_share_event),
+        )
         .route("/api/cloud-plans", get(handlers::get_cloud_plans))
         .route("/api/auth/me", get(auth::me))
         .route("/api/auth/google/start", get(auth::google_start))
@@ -138,7 +186,7 @@ fn cors_layer(config: &Config) -> Result<CorsLayer> {
         .collect::<Vec<_>>();
 
     let layer = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
     if origins.iter().any(|origin| origin.trim() == "*") {
         return Ok(layer.allow_origin(Any));
